@@ -59,18 +59,7 @@ jobs:
             echo "Android changes detected!"
           fi
 
-      - name: Merge upstream
-        if: steps.changes.outputs.changed == 'true'
-        run: |
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git config user.name "github-actions[bot]"
-          if git merge upstream/main -m "chore: sync with upstream/main"; then
-            echo "Merge succeeded"
-          else
-            echo "Merge conflict — resetting to upstream/main"
-            git merge --abort
-            git reset --hard upstream/main
-          fi
+
 
       - name: Setup Java 17
         if: steps.changes.outputs.changed == 'true'
@@ -187,7 +176,4 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push sync
-        if: steps.changes.outputs.changed == 'true'
-        run: |
-          git push origin main
+
