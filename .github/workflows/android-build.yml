@@ -1,13 +1,13 @@
-name: Build Android APK (thirdParty)
+name: Build Android APK (Dual Flavor)
 
 on:
   schedule:
-    # Check every 6 hours for upstream changes in apps/android/
+    # Check every 6 hours for upstream changes
     - cron: '0 */6 * * *'
   workflow_dispatch:
     inputs:
       force:
-        description: 'Force build even if no changes detected'
+        description: 'Force build even if no changes'
         type: boolean
         default: false
 
@@ -16,10 +16,15 @@ permissions:
   actions: read
 
 jobs:
-  build:
+  # ── Check upstream + extract version ──
+  check:
     runs-on: ubuntu-latest
     if: github.repository_owner == 'criollojoel10'
-
+    outputs:
+      changed: ${{ steps.changes.outputs.changed }}
+      reason: ${{ steps.changes.outputs.reason }}
+      version: ${{ steps.version.outputs.version }}
+      upstream_sha: ${{ steps.upstream.outputs.upstream_sha }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,146 +39,167 @@ jobs:
           git fetch upstream main --no-tags
           UPSTREAM_SHA=$(git rev-parse upstream/main)
           echo "upstream_sha=${UPSTREAM_SHA}" >> $GITHUB_OUTPUT
-          echo "Current HEAD: $(git rev-parse HEAD)"
-          echo "Upstream HEAD: ${UPSTREAM_SHA}"
 
       - name: Check for Android changes
         id: changes
         run: |
           FORCE="${{ github.event.inputs.force || 'false' }}"
-
-          # Compare our HEAD with upstream/main for android/ changes
           if git diff --quiet HEAD upstream/main -- apps/android/ 2>/dev/null; then
             if [ "$FORCE" = "true" ]; then
               echo "changed=true" >> $GITHUB_OUTPUT
               echo "reason=forced" >> $GITHUB_OUTPUT
-              echo "No changes but force=true"
             else
               echo "changed=false" >> $GITHUB_OUTPUT
-              echo "No Android changes since last build"
+              echo "reason=none" >> $GITHUB_OUTPUT
             fi
           else
             echo "changed=true" >> $GITHUB_OUTPUT
             echo "reason=changes" >> $GITHUB_OUTPUT
-            git diff --stat HEAD upstream/main -- apps/android/
-            echo "Android changes detected!"
           fi
 
+      - name: Extract version
+        id: version
+        run: |
+          VER=$(grep 'versionName' apps/android/app/build.gradle.kts | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
+          echo "version=${VER}" >> $GITHUB_OUTPUT
+          echo "Version: ${VER}"
 
+  # ── Build both flavors in parallel ──
+  build:
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: thirdParty
+            title: Third-Party (Full Capabilities)
+            capabilities: "SMS, Call Log, Photos, Full node"
+            gradle_task: assembleThirdPartyDebug
+            apk_pattern: thirdParty/debug/*.apk
+          - flavor: play
+            title: Play (Restricted)
+            capabilities: "No SMS/Call Log (Play Store policy)"
+            gradle_task: assemblePlayDebug
+            apk_pattern: play/debug/*.apk
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Java 17
-        if: steps.changes.outputs.changed == 'true'
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
+          cache: gradle
 
       - name: Setup Android SDK
-        if: steps.changes.outputs.changed == 'true'
         run: |
-          # Use the pre-installed Android SDK on the GitHub Actions runner
-          # Unset ANDROID_SDK_ROOT to avoid conflict with ANDROID_HOME
           unset ANDROID_SDK_ROOT
-
-          # GitHub runner already has ANDROID_HOME=/usr/local/lib/android/sdk
           export ANDROID_HOME=${ANDROID_HOME:-/usr/local/lib/android/sdk}
           echo "ANDROID_HOME=${ANDROID_HOME}" >> $GITHUB_ENV
-
-          # Install required SDK components (platform 36 + build-tools 36)
           if [ -x "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" ]; then
             SDKMANAGER="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
           else
             SDKMANAGER="${ANDROID_HOME}/cmdline-tools/bin/sdkmanager"
           fi
-
           echo "y" | $SDKMANAGER --sdk_root=${ANDROID_HOME} --licenses > /dev/null 2>&1 || true
           $SDKMANAGER --sdk_root=${ANDROID_HOME} \
             "platforms;android-36" \
             "build-tools;36.0.0" \
             "platform-tools"
 
-      - name: Generate CI keystore
-        if: steps.changes.outputs.changed == 'true'
-        run: |
-          keytool -genkeypair -v \
-            -keystore /tmp/openclaw-ci.keystore \
-            -alias openclaw-ci \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -storepass android \
-            -keypass android \
-            -dname "CN=OpenClaw CI, OU=CI, O=OpenClaw App, L=CI, ST=CI, C=US" \
-            -noprompt
-
-          mkdir -p ~/.gradle
-          cat >> ~/.gradle/gradle.properties << 'GRADLEEOF'
-          OPENCLAW_ANDROID_STORE_FILE=/tmp/openclaw-ci.keystore
-          OPENCLAW_ANDROID_STORE_PASSWORD=android
-          OPENCLAW_ANDROID_KEY_ALIAS=openclaw-ci
-          OPENCLAW_ANDROID_KEY_PASSWORD=android
-          GRADLEEOF
-
-      - name: Build thirdParty Release APK
-        if: steps.changes.outputs.changed == 'true'
+      - name: Build ${{ matrix.title }} Debug APK
         working-directory: apps/android
         run: |
           chmod +x gradlew
-          ./gradlew :app:assembleThirdPartyRelease --no-daemon \
+          ./gradlew :app:${{ matrix.gradle_task }} --no-daemon \
             -Dorg.gradle.jvmargs="-Xmx4096m -XX:MaxMetaspaceSize=512m"
 
-      - name: Find APK and version
-        if: steps.changes.outputs.changed == 'true'
+      - name: Collect APK
         id: apk
         run: |
-          APK_DIR="apps/android/app/build/outputs/apk/thirdParty/release"
+          APK_DIR="apps/android/app/build/outputs/apk/${{ matrix.flavor }}/debug"
           APK_FILE=$(ls ${APK_DIR}/*.apk 2>/dev/null | head -1)
           if [ -z "$APK_FILE" ]; then
-            echo "ERROR: No APK found!"
-            ls -la ${APK_DIR} 2>/dev/null || echo "Directory not found"
+            echo "ERROR: No APK in ${APK_DIR}"
+            find apps/android/app/build/outputs -name "*.apk" -type f 2>/dev/null
             exit 1
           fi
-          echo "apk_file=${APK_FILE}" >> $GITHUB_OUTPUT
-          echo "apk_name=$(basename ${APK_FILE})" >> $GITHUB_OUTPUT
-          echo "APK: ${APK_FILE}"
+          APK_NAME="openclaw-${{ matrix.flavor }}-debug.apk"
+          cp "$APK_FILE" "/tmp/${APK_NAME}"
+          sha256sum "/tmp/${APK_NAME}" > "/tmp/${APK_NAME}.sha256"
+          echo "apk_name=${APK_NAME}" >> $GITHUB_OUTPUT
+          echo "size=$(du -h /tmp/${APK_NAME} | cut -f1)" >> $GITHUB_OUTPUT
+          echo "sha256=$(cat /tmp/${APK_NAME}.sha256 | awk '{print $1}')" >> $GITHUB_OUTPUT
 
-          VER=$(grep 'versionName' apps/android/app/build.gradle.kts | head -1 | sed 's/.*"\([^"]*\)".*/\1/')
-          echo "version=${VER}" >> $GITHUB_OUTPUT
-          echo "Version: ${VER}"
+      - name: Upload ${{ matrix.flavor }} artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openclaw-${{ matrix.flavor }}-debug
+          path: |
+            /tmp/openclaw-${{ matrix.flavor }}-debug.apk
+            /tmp/openclaw-${{ matrix.flavor }}-debug.apk.sha256
+          if-no-files-found: error
+
+  # ── Release with both APKs ──
+  release:
+    needs: [check, build]
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all APKs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: openclaw-*-debug
+          merge-multiple: true
+          path: release/
+
+      - name: Prepare release assets
+        run: |
+          cd release
+          echo "## 📱 OpenClaw Android Debug Builds" >> body.md
+          echo "" >> body.md
+          echo "### 🔨 Build #${{ github.run_number }}" >> body.md
+          echo "- **Version:** \`${{ needs.check.outputs.version }}\`" >> body.md
+          echo "- **Upstream:** \`${{ needs.check.outputs.upstream_sha }}\`" >> body.md
+          echo "- **Reason:** ${{ needs.check.outputs.reason }}" >> body.md
+          echo "- **Type:** Debug (unsigned) — for sideloading only" >> body.md
+          echo "" >> body.md
+          for apk in *.apk; do
+            FLAVOR=$(echo "$apk" | sed 's/openclaw-//;s/-debug.apk//')
+            SHA=$(cat "${apk}.sha256" | awk '{print $1}')
+            SIZE=$(du -h "$apk" | cut -f1)
+            echo "### 🔹 ${FLAVOR} Flavor" >> body.md
+            echo "- **File:** \`${apk}\`" >> body.md
+            echo "- **Size:** ${SIZE}" >> body.md
+            echo "- **SHA256:** \`${SHA}\`" >> body.md
+            echo "" >> body.md
+          done
+          echo "### 📥 Install" >> body.md
+          echo '```bash' >> body.md
+          echo "# Third-Party (full capabilities: SMS, Call Log, Photos)" >> body.md
+          echo "adb install -r openclaw-thirdParty-debug.apk" >> body.md
+          echo "# Play (restricted, no SMS/Call Log)" >> body.md
+          echo "adb install -r openclaw-play-debug.apk" >> body.md
+          echo '```' >> body.md
+          echo "" >> body.md
+          echo "> ⚠️ Debug builds are unsigned. Uninstall before switching between CI and signed releases." >> body.md
 
       - name: Create GitHub Release
-        if: steps.changes.outputs.changed == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: android-v${{ steps.apk.outputs.version }}-b${{ github.run_number }}
-          name: "📱 OpenClaw Android thirdParty v${{ steps.apk.outputs.version }} (Build #${{ github.run_number }})"
-          files: ${{ steps.apk.outputs.apk_file }}
-          body: |
-            ## 🔧 OpenClaw Android — Third-Party Flavor
-
-            ### 📦 What's this?
-            The **thirdParty** flavor keeps all Android capabilities enabled:
-            - ✅ SMS send/read
-            - ✅ Call Log access
-            - ✅ Photos/media access
-            - ✅ Full node features
-
-            *(The Google Play flavor removes these due to Play Store policies.)*
-
-            ### 🔨 Build Info
-            - **Version:** `${{ steps.apk.outputs.version }}`
-            - **Upstream commit:** `${{ steps.upstream.outputs.upstream_sha }}`
-            - **Build reason:** `${{ steps.changes.outputs.reason }}`
-            - **Flavor:** `thirdParty`
-            - **Signing:** CI-generated (self-signed) — for sideloading only
-
-            ### 📥 Install
-            ```bash
-            adb install -r ${{ steps.apk.outputs.apk_name }}
-            # or sideload from device
-            ```
-
-            > ⚠️ This APK is built automatically from [openclaw/openclaw](https://github.com/openclaw/openclaw) upstream.
-            > It uses a CI-generated keystore — you'll need to uninstall before switching between CI builds and official releases.
+          tag_name: android-v${{ needs.check.outputs.version }}-b${{ github.run_number }}
+          name: "📱 OpenClaw Android v${{ needs.check.outputs.version }} (Build #${{ github.run_number }})"
+          files: |
+            release/*.apk
+            release/*.sha256
+          body_path: release/body.md
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-
