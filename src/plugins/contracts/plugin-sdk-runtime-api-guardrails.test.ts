@@ -1,3 +1,4 @@
+// Plugin SDK runtime API guardrail tests cover runtime API export safety and boundaries.
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -35,6 +36,7 @@ const UNGUARDED_RUNTIME_API_PLUGIN_IDS = [
   "tlon",
   "tokenjuice",
   "webhooks",
+  "workboard",
   "zai",
   "zalo",
   "zalouser",
@@ -255,7 +257,7 @@ const RUNTIME_API_EXPORT_GUARDS: Record<string, readonly string[]> = {
       'export { getActiveWebListener, resolveWebAccountId, type ActiveWebListener, type ActiveWebSendOptions } from "./src/active-listener.js";',
       'export { handleWhatsAppAction, whatsAppActionRuntime } from "./src/action-runtime.js";',
       'export { createWhatsAppLoginTool } from "./src/agent-tools-login.js";',
-      'export { formatWhatsAppWebAuthStatusState, getWebAuthAgeMs, hasWebCredsSync, logWebSelfId, logoutWeb, pickWebChannel, readCredsJsonRaw, readWebAuthExistsBestEffort, readWebAuthExistsForDecision, readWebAuthSnapshot, readWebAuthSnapshotBestEffort, readWebAuthState, readWebSelfId, readWebSelfIdentity, readWebSelfIdentityForDecision, resolveDefaultWebAuthDir, resolveWebCredsBackupPath, resolveWebCredsPath, restoreCredsFromBackupIfNeeded, WA_WEB_AUTH_DIR, webAuthExists, WHATSAPP_AUTH_UNSTABLE_CODE, WhatsAppAuthUnstableError, type WhatsAppWebAuthState } from "./src/auth-store.js";',
+      'export { formatWhatsAppWebAuthStatusState, getWebAuthAgeMs, hasWebCredsSync, logWebSelfId, logoutWeb, pickWebChannel, readCredsJsonRaw, readWebAuthExistsBestEffort, readWebAuthExistsForDecision, readWebAuthSnapshot, readWebAuthSnapshotBestEffort, readWebAuthState, readWebSelfId, readWebSelfIdentity, readWebSelfIdentityForDecision, resolveDefaultWebAuthDir, resolveWebCredsBackupPath, resolveWebCredsPath, restoreCredsFromBackupIfNeeded, webAuthExists, WA_WEB_AUTH_DIR, WHATSAPP_AUTH_UNSTABLE_CODE, WhatsAppAuthUnstableError, type WhatsAppWebAuthState } from "./src/auth-store.js";',
       'export { DEFAULT_WEB_MEDIA_BYTES, HEARTBEAT_PROMPT, HEARTBEAT_TOKEN, monitorWebChannel, SILENT_REPLY_TOKEN, stripHeartbeatToken, type WebChannelStatus, type WebMonitorTuning } from "./src/auto-reply.js";',
       'export { extractContactContext, extractLocationData, extractMediaPlaceholder, extractText, monitorWebInbox, resetWebInboundDedupe, type WebInboundMessage, type WebListenerCloseReason } from "./src/inbound.js";',
       'export { loginWeb } from "./src/login.js";',
@@ -378,6 +380,17 @@ describe("runtime api guardrails", () => {
     });
     expect(readExportStatements(setterFile)).toEqual([
       'export { setMatrixRuntime } from "./src/runtime.js";',
+    ]);
+  });
+
+  it("keeps Feishu's narrow runtime-setter entrypoint pinned to a single export", () => {
+    const setterFile = bundledPluginFile({
+      rootDir: ROOT_DIR,
+      pluginId: "feishu",
+      relativePath: "runtime-setter-api.ts",
+    });
+    expect(readExportStatements(setterFile)).toEqual([
+      'export { setFeishuRuntime } from "./src/runtime.js";',
     ]);
   });
 });

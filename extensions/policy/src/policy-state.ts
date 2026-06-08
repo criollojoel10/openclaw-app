@@ -1,5 +1,7 @@
+// Policy plugin module implements policy state behavior.
 import { createHash } from "node:crypto";
 import { normalizeProviderId } from "openclaw/plugin-sdk/provider-model-shared";
+import { normalizeAgentId } from "openclaw/plugin-sdk/routing";
 import { coerceSecretRef } from "openclaw/plugin-sdk/secret-input";
 import {
   asBoolean as readBoolean,
@@ -10,6 +12,17 @@ import { POLICY_TOOL_GROUPS } from "./tool-policy-conformance.js";
 
 // Mirrors the sandbox browser config default without importing core internals into the policy plugin.
 const DEFAULT_POLICY_SANDBOX_BROWSER_NETWORK = "openclaw-sandbox-browser";
+const ALLOWLIST_DEFAULT_INGRESS_GROUP_POLICY_CHANNELS = new Set([
+  "googlechat",
+  "irc",
+  "line",
+  "mattermost",
+  "matrix",
+  "msteams",
+  "nextcloud-talk",
+  "signal",
+]);
+const OPEN_GROUPS_DEFAULT_TO_NO_MENTION_CHANNELS = new Set(["feishu", "qa-channel"]);
 
 export type PolicyAttestation = {
   readonly checkedAt: string;
@@ -34,8 +47,10 @@ export type PolicyEvidence = {
   readonly modelProviders: readonly PolicyModelProviderEvidence[];
   readonly modelRefs: readonly PolicyModelRefEvidence[];
   readonly network: readonly PolicyNetworkEvidence[];
+  readonly ingress?: readonly PolicyIngressEvidence[];
   readonly gatewayExposure?: readonly PolicyGatewayExposureEvidence[];
   readonly agentWorkspace?: readonly PolicyAgentWorkspaceEvidence[];
+  readonly dataHandling?: readonly PolicyDataHandlingEvidence[];
   readonly secrets?: readonly PolicySecretEvidence[];
   readonly authProfiles?: readonly PolicyAuthProfileEvidence[];
 };
@@ -126,6 +141,21 @@ export type PolicyNetworkEvidence = {
   readonly value: boolean;
 };
 
+export type PolicyIngressEvidence = {
+  readonly id: string;
+  readonly kind:
+    | "channelDmPolicy"
+    | "channelGroupPolicy"
+    | "channelRequireMention"
+    | "sessionDmScope";
+  readonly source: string;
+  readonly channel?: string;
+  readonly accountId?: string;
+  readonly groupId?: string;
+  readonly value?: boolean | string;
+  readonly explicit?: boolean;
+};
+
 export type PolicyGatewayExposureEvidence = {
   readonly id: string;
   readonly kind:
@@ -177,6 +207,20 @@ export type PolicyAuthProfileEvidence = {
   readonly validMetadata: boolean;
   readonly provider?: string;
   readonly mode?: string;
+};
+
+export type PolicyDataHandlingEvidence = {
+  readonly id: string;
+  readonly kind:
+    | "memorySessionTranscriptIndexing"
+    | "sensitiveLoggingRedaction"
+    | "sessionRetentionMode"
+    | "telemetryContentCapture";
+  readonly source: string;
+  readonly scope: "global" | "agent";
+  readonly agentId?: string;
+  readonly value?: boolean | string;
+  readonly explicit?: boolean;
 };
 
 type SecretRefEvidence = {
@@ -250,8 +294,10 @@ export function collectPolicyEvidence(
   cfg: Record<string, unknown>,
   options?: {
     readonly toolsRaw?: undefined;
+    readonly includeIngress?: boolean;
     readonly includeGatewayExposure?: boolean;
     readonly includeAgentWorkspace?: boolean;
+    readonly includeDataHandling?: boolean;
     readonly includeToolPosture?: boolean;
     readonly includeSandboxPosture?: boolean;
     readonly includeSecrets?: boolean;
@@ -262,8 +308,10 @@ export function collectPolicyEvidence(
   cfg: Record<string, unknown>,
   options: {
     readonly toolsRaw: string;
+    readonly includeIngress?: boolean;
     readonly includeGatewayExposure?: boolean;
     readonly includeAgentWorkspace?: boolean;
+    readonly includeDataHandling?: boolean;
     readonly includeToolPosture?: boolean;
     readonly includeSandboxPosture?: boolean;
     readonly includeSecrets?: boolean;
@@ -274,8 +322,10 @@ export function collectPolicyEvidence(
   cfg: Record<string, unknown>,
   options: {
     readonly toolsRaw?: string;
+    readonly includeIngress?: boolean;
     readonly includeGatewayExposure?: boolean;
     readonly includeAgentWorkspace?: boolean;
+    readonly includeDataHandling?: boolean;
     readonly includeToolPosture?: boolean;
     readonly includeSandboxPosture?: boolean;
     readonly includeSecrets?: boolean;
@@ -288,12 +338,14 @@ export function collectPolicyEvidence(
     modelProviders: scanPolicyModelProviders(cfg),
     modelRefs: scanPolicyModelRefs(cfg),
     network: scanPolicyNetwork(cfg),
+    ...(options.includeIngress === false ? {} : { ingress: scanPolicyIngress(cfg) }),
     ...(options.includeGatewayExposure === false
       ? {}
       : { gatewayExposure: scanPolicyGatewayExposure(cfg) }),
     ...(options.includeAgentWorkspace === false
       ? {}
       : { agentWorkspace: scanPolicyAgentWorkspace(cfg) }),
+    ...(options.includeDataHandling === false ? {} : { dataHandling: scanPolicyDataHandling(cfg) }),
     ...(options.includeToolPosture === false ? {} : { toolPosture: scanPolicyToolPosture(cfg) }),
     ...(options.includeSandboxPosture === false
       ? {}
@@ -421,6 +473,60 @@ export function scanPolicyNetwork(cfg: Record<string, unknown>): readonly Policy
       "oc://openclaw.config/tools/web/fetch/ssrfPolicy/allowIpv6UniqueLocalRange",
     ),
   ].filter((entry): entry is PolicyNetworkEvidence => entry !== undefined);
+}
+
+export function scanPolicyIngress(cfg: Record<string, unknown>): readonly PolicyIngressEvidence[] {
+  const channels = configuredChannels(cfg);
+  const channelDefaults = isRecord(channels.defaults) ? channels.defaults : {};
+  const inheritedChannelDefaults = pickSupportedIngressDefaults(channelDefaults);
+  const channelDefaultsSource = "oc://openclaw.config/channels/defaults";
+  const entries: PolicyIngressEvidence[] = [];
+  const session = isRecord(cfg.session) ? cfg.session : {};
+  const dmScope = readString(session.dmScope)?.toLowerCase();
+  entries.push({
+    id: "session-dm-scope",
+    kind: "sessionDmScope",
+    source: "oc://openclaw.config/session/dmScope",
+    value: dmScope ?? "main",
+    explicit: dmScope !== undefined,
+  });
+
+  for (const [channel, value] of Object.entries(channels)) {
+    if (RESERVED_CHANNEL_CONFIG_KEYS.has(channel) || !isRecord(value) || value.enabled === false) {
+      continue;
+    }
+    const channelSource = `oc://openclaw.config/channels/${ocPathSegment(channel)}`;
+    const accounts = isRecord(value.accounts) ? value.accounts : {};
+    const configuredAccounts = Object.entries(accounts).filter(
+      (entry): entry is [string, Record<string, unknown>] => isRecord(entry[1]),
+    );
+    const activeAccounts = configuredAccounts.filter(([, account]) => account.enabled !== false);
+    if (configuredAccounts.length === 0 || hasImplicitDefaultAccountConfig(channel, value)) {
+      pushChannelIngress(entries, {
+        channel,
+        config: value,
+        inheritedConfig: inheritedChannelDefaults,
+        sourceBase: channelSource,
+        inheritedSourceBase: channelDefaultsSource,
+        fallbackSourceBase: channelSource,
+      });
+    }
+    for (const [accountId, account] of activeAccounts) {
+      const inheritsNestedContainers = channel !== "telegram" || configuredAccounts.length <= 1;
+      pushChannelIngress(entries, {
+        channel,
+        accountId,
+        config: account,
+        inheritedConfig: value,
+        inheritNestedContainers: inheritsNestedContainers,
+        sourceBase: `${channelSource}/accounts/${ocPathSegment(accountId)}`,
+        inheritedSourceBase: channelSource,
+        fallbackConfig: inheritedChannelDefaults,
+        fallbackSourceBase: channelDefaultsSource,
+      });
+    }
+  }
+  return entries.toSorted((a, b) => a.source.localeCompare(b.source) || a.id.localeCompare(b.id));
 }
 
 export function scanPolicyGatewayExposure(
@@ -708,6 +814,202 @@ export function scanPolicyAuthProfiles(
       }
       return entry;
     });
+}
+
+export function scanPolicyDataHandling(
+  cfg: Record<string, unknown>,
+): readonly PolicyDataHandlingEvidence[] {
+  const entries: PolicyDataHandlingEvidence[] = [];
+  const logging = isRecord(cfg.logging) ? cfg.logging : {};
+  entries.push({
+    id: "logging-redaction",
+    kind: "sensitiveLoggingRedaction",
+    source: "oc://openclaw.config/logging/redactSensitive",
+    scope: "global",
+    value: logging.redactSensitive !== "off",
+    explicit: logging.redactSensitive !== undefined,
+  });
+
+  const diagnostics = isRecord(cfg.diagnostics) ? cfg.diagnostics : {};
+  const otel = isRecord(diagnostics.otel) ? diagnostics.otel : {};
+  const otelEnabled = diagnostics.enabled !== false && otel.enabled === true;
+  const tracesEnabled = otelEnabled && otel.traces !== false;
+  const logsEnabled = otelEnabled && otel.logs === true;
+  const captureContent =
+    otelEnabled &&
+    telemetryContentCaptureEnabled(otel.captureContent, {
+      tracesEnabled,
+      logsEnabled,
+    });
+  entries.push({
+    id: "diagnostics-otel-content-capture",
+    kind: "telemetryContentCapture",
+    source: "oc://openclaw.config/diagnostics/otel/captureContent",
+    scope: "global",
+    value: captureContent,
+    explicit: otel.captureContent !== undefined,
+  });
+
+  const session = isRecord(cfg.session) ? cfg.session : {};
+  const maintenance = isRecord(session.maintenance) ? session.maintenance : {};
+  const retentionMode = typeof maintenance.mode === "string" ? maintenance.mode : "enforce";
+  entries.push({
+    id: "session-maintenance-mode",
+    kind: "sessionRetentionMode",
+    source: "oc://openclaw.config/session/maintenance/mode",
+    scope: "global",
+    value: retentionMode,
+    explicit: maintenance.mode !== undefined,
+  });
+
+  pushMemorySessionTranscriptIndexing(entries, cfg);
+  return entries.toSorted((a, b) => a.source.localeCompare(b.source));
+}
+
+function telemetryContentCaptureEnabled(
+  value: unknown,
+  signals: { readonly tracesEnabled: boolean; readonly logsEnabled: boolean },
+): boolean {
+  if (value === true) {
+    return signals.tracesEnabled || signals.logsEnabled;
+  }
+  if (!isRecord(value)) {
+    return false;
+  }
+  if (!signals.tracesEnabled) {
+    return false;
+  }
+  if (value.enabled !== true) {
+    return false;
+  }
+  return (
+    value.inputMessages === true ||
+    value.outputMessages === true ||
+    value.toolInputs === true ||
+    value.toolOutputs === true ||
+    value.systemPrompt === true ||
+    value.toolDefinitions === true
+  );
+}
+
+function pushMemorySessionTranscriptIndexing(
+  entries: PolicyDataHandlingEvidence[],
+  cfg: Record<string, unknown>,
+): void {
+  const memory = isRecord(cfg.memory) ? cfg.memory : {};
+  const qmd = isRecord(memory.qmd) ? memory.qmd : {};
+  const qmdSessions = isRecord(qmd.sessions) ? qmd.sessions : {};
+  if (qmdSessions.enabled !== undefined) {
+    entries.push({
+      id: "memory-qmd-session-transcripts",
+      kind: "memorySessionTranscriptIndexing",
+      source: "oc://openclaw.config/memory/qmd/sessions/enabled",
+      scope: "global",
+      value: memory.backend === "qmd" && readBoolean(qmdSessions.enabled) === true,
+      explicit: true,
+    });
+  }
+
+  const agents = isRecord(cfg.agents) ? cfg.agents : {};
+  const defaults = isRecord(agents.defaults) ? agents.defaults : {};
+  const defaultsMemorySearch = isRecord(defaults.memorySearch) ? defaults.memorySearch : {};
+  const defaultSessionMemory = memorySearchSessionTranscriptIndexing(defaultsMemorySearch);
+  if (defaultSessionMemory !== undefined) {
+    entries.push({
+      id: "agents-defaults-memory-session-transcripts",
+      kind: "memorySessionTranscriptIndexing",
+      source: "oc://openclaw.config/agents/defaults/memorySearch/experimental/sessionMemory",
+      scope: "global",
+      value: defaultSessionMemory,
+      explicit: true,
+    });
+  }
+
+  if (!Array.isArray(agents.list)) {
+    return;
+  }
+  agents.list.forEach((rawAgent, index) => {
+    if (!isRecord(rawAgent)) {
+      return;
+    }
+    const agentId =
+      readString(rawAgent.id) ??
+      readString(rawAgent.name) ??
+      readString(rawAgent.slug) ??
+      `agent-${index}`;
+    const memorySearch = isRecord(rawAgent.memorySearch) ? rawAgent.memorySearch : undefined;
+    const agentSessionMemory =
+      memorySearch === undefined
+        ? defaultSessionMemory
+        : memorySearchSessionTranscriptIndexing(memorySearch, defaultsMemorySearch);
+    if (agentSessionMemory === undefined) {
+      return;
+    }
+    const explicit = memorySearchSessionTranscriptIndexingHasLocalConfig(memorySearch);
+    entries.push({
+      id: `${agentId}-memory-session-transcripts`,
+      kind: "memorySessionTranscriptIndexing",
+      source: explicit
+        ? `oc://openclaw.config/agents/list/#${index}/memorySearch/experimental/sessionMemory`
+        : "oc://openclaw.config/agents/defaults/memorySearch/experimental/sessionMemory",
+      scope: "agent",
+      agentId: normalizeAgentId(agentId),
+      value: agentSessionMemory,
+      explicit,
+    });
+  });
+}
+
+function memorySearchSessionTranscriptIndexing(
+  memorySearch: unknown,
+  inheritedMemorySearch?: unknown,
+): boolean | undefined {
+  if (!isRecord(memorySearch)) {
+    return undefined;
+  }
+  const experimental = isRecord(memorySearch.experimental) ? memorySearch.experimental : {};
+  const inherited = isRecord(inheritedMemorySearch) ? inheritedMemorySearch : {};
+  const inheritedExperimental = isRecord(inherited.experimental) ? inherited.experimental : {};
+  const enabled = readBoolean(memorySearch.enabled) ?? readBoolean(inherited.enabled) ?? true;
+  const sessionMemory =
+    readBoolean(experimental.sessionMemory) ?? readBoolean(inheritedExperimental.sessionMemory);
+  const sourcesIncludeSessions =
+    memorySearchSourcesIncludeSessions(memorySearch) ??
+    memorySearchSourcesIncludeSessions(inherited) ??
+    false;
+  if (
+    sessionMemory === undefined &&
+    memorySearchSourcesIncludeSessions(memorySearch) === undefined &&
+    readBoolean(memorySearch.enabled) === undefined
+  ) {
+    return undefined;
+  }
+  if (!enabled) {
+    return false;
+  }
+  return sessionMemory === true && sourcesIncludeSessions;
+}
+
+function memorySearchSessionTranscriptIndexingHasLocalConfig(memorySearch: unknown): boolean {
+  if (!isRecord(memorySearch)) {
+    return false;
+  }
+  const experimental = isRecord(memorySearch.experimental) ? memorySearch.experimental : {};
+  return (
+    readBoolean(memorySearch.enabled) !== undefined ||
+    readBoolean(experimental.sessionMemory) !== undefined ||
+    memorySearchSourcesIncludeSessions(memorySearch) !== undefined
+  );
+}
+
+function memorySearchSourcesIncludeSessions(memorySearch: unknown): boolean | undefined {
+  if (!isRecord(memorySearch) || memorySearch.sources === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(memorySearch.sources)) {
+    return false;
+  }
+  return memorySearch.sources.includes("sessions");
 }
 
 function scanPolicySecretProviders(cfg: Record<string, unknown>): readonly PolicySecretEvidence[] {
@@ -1431,6 +1733,22 @@ function pushToolAlsoAllowPostureList(
 }
 
 const AGENT_WORKSPACE_POLICY_TOOLS = ["exec", "process", "write", "edit", "apply_patch"] as const;
+const IMPLICIT_DEFAULT_ACCOUNT_FIELDS: Readonly<Record<string, readonly string[]>> = {
+  discord: ["token"],
+  googlechat: ["serviceAccount", "serviceAccountRef", "serviceAccountFile"],
+  imessage: ["cliPath", "dbPath"],
+  "qa-channel": ["baseUrl"],
+  qqbot: ["appId", "clientSecret", "clientSecretFile"],
+  signal: ["account"],
+  slack: ["appToken", "botToken", "signingSecret"],
+  "synology-chat": ["token"],
+  telegram: ["botToken", "tokenFile"],
+  tlon: ["ship"],
+  twitch: ["username"],
+  whatsapp: ["authDir"],
+  zalo: ["botToken", "tokenFile"],
+  zalouser: ["profile"],
+};
 
 function readStringArray(value: unknown): readonly string[] {
   if (!Array.isArray(value)) {
@@ -1809,6 +2127,356 @@ function networkBooleanEvidence(
 ): PolicyNetworkEvidence | undefined {
   const value = readBooleanPath(cfg, path);
   return value === undefined ? undefined : { id, source, value };
+}
+
+function pickSupportedIngressDefaults(config: Record<string, unknown>): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  if (config.groupPolicy !== undefined) {
+    result.groupPolicy = config.groupPolicy;
+  }
+  return result;
+}
+
+function hasImplicitDefaultAccountConfig(
+  channel: string,
+  config: Record<string, unknown>,
+): boolean {
+  switch (channel) {
+    case "clickclack":
+      return (
+        hasConfiguredAccountValue(config.baseUrl) &&
+        hasConfiguredAccountValue(config.workspace) &&
+        hasConfiguredAccountValue(config.token)
+      );
+    case "feishu":
+      return hasConfiguredAccountValue(config.appId) && hasConfiguredAccountValue(config.appSecret);
+    case "irc":
+      return hasConfiguredAccountValue(config.host) && hasConfiguredAccountValue(config.nick);
+    case "line":
+      return (
+        hasConfiguredAccountValue(config.channelAccessToken) ||
+        hasConfiguredAccountValue(config.tokenFile)
+      );
+    case "matrix":
+      return (
+        hasConfiguredAccountValue(config.homeserver) &&
+        (hasConfiguredAccountValue(config.accessToken) ||
+          (hasConfiguredAccountValue(config.userId) && hasConfiguredAccountValue(config.password)))
+      );
+    case "mattermost":
+      return (
+        hasConfiguredAccountValue(config.baseUrl) && hasConfiguredAccountValue(config.botToken)
+      );
+    case "nextcloud-talk":
+      return (
+        hasConfiguredAccountValue(config.baseUrl) &&
+        (hasConfiguredAccountValue(config.botSecret) ||
+          hasConfiguredAccountValue(config.botSecretFile))
+      );
+    default:
+      return (IMPLICIT_DEFAULT_ACCOUNT_FIELDS[channel] ?? []).some((field) =>
+        hasConfiguredAccountValue(config[field]),
+      );
+  }
+}
+
+function hasConfiguredAccountValue(value: unknown): boolean {
+  return typeof value === "string"
+    ? value.trim().length > 0
+    : value !== undefined && value !== null;
+}
+
+type ChannelIngressParams = {
+  readonly channel: string;
+  readonly accountId?: string;
+  readonly config: Record<string, unknown>;
+  readonly inheritedConfig: Record<string, unknown>;
+  readonly inheritNestedContainers?: boolean;
+  readonly sourceBase: string;
+  readonly inheritedSourceBase: string;
+  readonly fallbackConfig?: Record<string, unknown>;
+  readonly fallbackSourceBase: string;
+};
+
+function pushChannelIngress(entries: PolicyIngressEvidence[], params: ChannelIngressParams): void {
+  const localDmPolicy = channelDmPolicy(params.config);
+  const inheritedDmPolicy = channelDmPolicy(params.inheritedConfig);
+  const fallbackDmPolicy = channelDmPolicy(params.fallbackConfig ?? {});
+  const effectiveDmPolicy =
+    localDmPolicy.disabledByEnabled === true
+      ? localDmPolicy
+      : localDmPolicy.value !== undefined
+        ? localDmPolicy
+        : inheritedDmPolicy.disabledByEnabled === true
+          ? inheritedDmPolicy
+          : inheritedDmPolicy.value !== undefined
+            ? inheritedDmPolicy
+            : fallbackDmPolicy.disabledByEnabled === true || fallbackDmPolicy.value !== undefined
+              ? fallbackDmPolicy
+              : undefined;
+  const dmPolicySource =
+    effectiveDmPolicy?.sourceSuffix === undefined
+      ? `${params.fallbackSourceBase}/dmPolicy`
+      : effectiveDmPolicy === localDmPolicy
+        ? `${params.sourceBase}/${effectiveDmPolicy.sourceSuffix}`
+        : effectiveDmPolicy === inheritedDmPolicy
+          ? `${params.inheritedSourceBase}/${effectiveDmPolicy.sourceSuffix}`
+          : `${params.fallbackSourceBase}/${effectiveDmPolicy.sourceSuffix}`;
+  entries.push({
+    id: channelIngressId(params, "dm-policy"),
+    kind: "channelDmPolicy",
+    source: dmPolicySource,
+    channel: params.channel,
+    ...(params.accountId === undefined ? {} : { accountId: params.accountId }),
+    value: effectiveDmPolicy?.value ?? "pairing",
+    explicit: effectiveDmPolicy !== undefined,
+  });
+
+  const localGroupPolicy = readString(params.config.groupPolicy);
+  const inheritedGroupPolicy = readString(params.inheritedConfig.groupPolicy);
+  const fallbackGroupPolicy = readString(params.fallbackConfig?.groupPolicy);
+  const implicitGroupPolicy = channelImplicitGroupPolicy(params);
+  entries.push({
+    id: channelIngressId(params, "group-policy"),
+    kind: "channelGroupPolicy",
+    source:
+      localGroupPolicy !== undefined
+        ? `${params.sourceBase}/groupPolicy`
+        : inheritedGroupPolicy !== undefined
+          ? `${params.inheritedSourceBase}/groupPolicy`
+          : fallbackGroupPolicy !== undefined
+            ? `${params.fallbackSourceBase}/groupPolicy`
+            : implicitGroupPolicy.source,
+    channel: params.channel,
+    ...(params.accountId === undefined ? {} : { accountId: params.accountId }),
+    value:
+      localGroupPolicy ?? inheritedGroupPolicy ?? fallbackGroupPolicy ?? implicitGroupPolicy.value,
+    explicit:
+      localGroupPolicy !== undefined ||
+      inheritedGroupPolicy !== undefined ||
+      fallbackGroupPolicy !== undefined,
+  });
+
+  pushChannelRequireMentionIngress(entries, params);
+}
+
+function channelImplicitGroupPolicy(params: ChannelIngressParams): {
+  readonly source: string;
+  readonly value: "allowlist" | "open";
+} {
+  for (const [config, sourceBase] of [
+    [params.config, params.sourceBase],
+    ...(params.inheritNestedContainers === true
+      ? ([[params.inheritedConfig, params.inheritedSourceBase]] as const)
+      : []),
+    [params.fallbackConfig, params.fallbackSourceBase],
+  ] as const) {
+    if (config === undefined || sourceBase === undefined) {
+      continue;
+    }
+    for (const key of ["groups"] as const) {
+      const container = isRecord(config[key]) ? config[key] : undefined;
+      if (container !== undefined && Object.keys(container).length > 0) {
+        return { source: `${sourceBase}/${key}`, value: "allowlist" };
+      }
+    }
+  }
+  return {
+    source: `${params.sourceBase}/groupPolicy`,
+    value: ALLOWLIST_DEFAULT_INGRESS_GROUP_POLICY_CHANNELS.has(params.channel)
+      ? "allowlist"
+      : "open",
+  };
+}
+
+function pushChannelRequireMentionIngress(
+  entries: PolicyIngressEvidence[],
+  params: ChannelIngressParams,
+): void {
+  const localRequireMention = readBoolean(params.config.requireMention);
+  const inheritedRequireMention = readBoolean(params.inheritedConfig.requireMention);
+  const fallbackRequireMention = readBoolean(params.fallbackConfig?.requireMention);
+  const wildcardRequireMention = channelWildcardRequireMention(params);
+  const defaultRequireMention = channelDefaultRequireMention(params);
+  entries.push({
+    id: channelIngressId(params, "require-mention"),
+    kind: "channelRequireMention",
+    source:
+      wildcardRequireMention !== undefined
+        ? wildcardRequireMention.source
+        : localRequireMention !== undefined
+          ? `${params.sourceBase}/requireMention`
+          : inheritedRequireMention !== undefined
+            ? `${params.inheritedSourceBase}/requireMention`
+            : fallbackRequireMention !== undefined
+              ? `${params.fallbackSourceBase}/requireMention`
+              : `${params.sourceBase}/requireMention`,
+    channel: params.channel,
+    ...(params.accountId === undefined ? {} : { accountId: params.accountId }),
+    value:
+      wildcardRequireMention?.value ??
+      localRequireMention ??
+      inheritedRequireMention ??
+      fallbackRequireMention ??
+      defaultRequireMention,
+    explicit:
+      wildcardRequireMention !== undefined ||
+      localRequireMention !== undefined ||
+      inheritedRequireMention !== undefined ||
+      fallbackRequireMention !== undefined,
+  });
+
+  const containers = nestedIngressContainers(params);
+  for (const { containerKey, container, sourceBase } of containers) {
+    for (const [groupId, groupConfig] of Object.entries(container)) {
+      if (!isRecord(groupConfig)) {
+        continue;
+      }
+      pushNestedRequireMentionIngress(
+        entries,
+        params,
+        containerKey,
+        groupId,
+        groupConfig,
+        sourceBase,
+      );
+    }
+  }
+}
+
+function channelDefaultRequireMention(params: ChannelIngressParams): boolean {
+  const groupPolicy =
+    readString(params.config.groupPolicy) ??
+    readString(params.inheritedConfig.groupPolicy) ??
+    readString(params.fallbackConfig?.groupPolicy) ??
+    channelImplicitGroupPolicy(params).value;
+  return !(
+    groupPolicy === "open" && OPEN_GROUPS_DEFAULT_TO_NO_MENTION_CHANNELS.has(params.channel)
+  );
+}
+
+function channelWildcardRequireMention(
+  params: ChannelIngressParams,
+): { readonly source: string; readonly value: boolean } | undefined {
+  for (const [config, sourceBase] of [
+    [params.config, params.sourceBase],
+    [params.inheritedConfig, params.inheritedSourceBase],
+    [params.fallbackConfig, params.fallbackSourceBase],
+  ] as const) {
+    if (config === undefined || sourceBase === undefined) {
+      continue;
+    }
+    for (const key of ["groups", "guilds", "channels", "rooms", "teams"] as const) {
+      const container = isRecord(config[key]) ? config[key] : undefined;
+      const wildcard = isRecord(container?.["*"]) ? container["*"] : undefined;
+      const requireMention = readBoolean(wildcard?.requireMention);
+      if (wildcard?.enabled !== false && requireMention !== undefined) {
+        return {
+          source: `${sourceBase}/${key}/${ocPathSegment("*")}/requireMention`,
+          value: requireMention,
+        };
+      }
+    }
+  }
+  return undefined;
+}
+
+function nestedIngressContainers(params: ChannelIngressParams): readonly {
+  readonly containerKey: string;
+  readonly container: Record<string, unknown>;
+  readonly sourceBase: string;
+}[] {
+  const containers: {
+    readonly containerKey: string;
+    readonly container: Record<string, unknown>;
+    readonly sourceBase: string;
+  }[] = [];
+  for (const key of ["groups", "guilds", "channels", "rooms", "teams"] as const) {
+    const local = isRecord(params.config[key]) ? params.config[key] : undefined;
+    const inherited = isRecord(params.inheritedConfig[key])
+      ? params.inheritedConfig[key]
+      : undefined;
+    if (local !== undefined) {
+      if (Object.keys(local).length > 0) {
+        containers.push({ containerKey: key, container: local, sourceBase: params.sourceBase });
+      }
+    } else if (params.inheritNestedContainers === true && inherited !== undefined) {
+      containers.push({
+        containerKey: key,
+        container: inherited,
+        sourceBase: params.inheritedSourceBase,
+      });
+    }
+  }
+  return containers;
+}
+
+function pushNestedRequireMentionIngress(
+  entries: PolicyIngressEvidence[],
+  params: ChannelIngressParams,
+  containerKey: string,
+  groupId: string,
+  config: Record<string, unknown>,
+  parentSourceBase: string,
+): void {
+  if (config.enabled === false) {
+    return;
+  }
+  const sourceBase = `${parentSourceBase}/${containerKey}/${ocPathSegment(groupId)}`;
+  const requireMention = readBoolean(config.requireMention);
+  if (requireMention !== undefined) {
+    entries.push({
+      id: `${channelIngressId(params, `${containerKey}-${ocPathSegment(groupId)}`)}-require-mention`,
+      kind: "channelRequireMention",
+      source: `${sourceBase}/requireMention`,
+      channel: params.channel,
+      ...(params.accountId === undefined ? {} : { accountId: params.accountId }),
+      groupId,
+      value: requireMention ?? true,
+      explicit: requireMention !== undefined,
+    });
+  }
+  for (const nestedKey of ["channels", "topics"] as const) {
+    const nested = config[nestedKey];
+    if (!isRecord(nested)) {
+      continue;
+    }
+    for (const [nestedId, nestedConfig] of Object.entries(nested)) {
+      if (isRecord(nestedConfig)) {
+        pushNestedRequireMentionIngress(
+          entries,
+          params,
+          `${containerKey}/${ocPathSegment(groupId)}/${nestedKey}`,
+          nestedId,
+          nestedConfig,
+          parentSourceBase,
+        );
+      }
+    }
+  }
+}
+
+function channelDmPolicy(config: Record<string, unknown>): {
+  readonly value?: string;
+  readonly sourceSuffix?: string;
+  readonly disabledByEnabled?: boolean;
+} {
+  const dm = isRecord(config.dm) ? config.dm : {};
+  if (dm.enabled === false) {
+    return { value: "disabled", sourceSuffix: "dm/enabled", disabledByEnabled: true };
+  }
+  const direct = readString(config.dmPolicy);
+  if (direct !== undefined) {
+    return { value: direct, sourceSuffix: "dmPolicy" };
+  }
+  const legacy = readString(dm.policy);
+  return legacy === undefined ? {} : { value: legacy, sourceSuffix: "dm/policy" };
+}
+
+function channelIngressId(params: ChannelIngressParams, suffix: string): string {
+  return params.accountId === undefined
+    ? `${params.channel}-${suffix}`
+    : `${params.channel}-${params.accountId}-${suffix}`;
 }
 
 function pushGatewayBooleanEvidence(

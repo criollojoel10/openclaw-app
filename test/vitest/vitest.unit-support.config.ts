@@ -1,3 +1,4 @@
+// Vitest unit support config wires the unit support test shard.
 import { createUnitVitestConfigWithOptions } from "./vitest.unit.config.ts";
 
 export default createUnitVitestConfigWithOptions(process.env, {
@@ -9,6 +10,7 @@ export default createUnitVitestConfigWithOptions(process.env, {
     // The gateway-protocol package rides with gateway-client because the client
     // package owns the browser/runtime protocol compatibility lane.
     "packages/gateway-protocol/src/**/*.test.ts",
+    "packages/gateway-client/src/**/*.test.ts",
   ],
   passWithNoTests: true,
 });

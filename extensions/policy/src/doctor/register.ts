@@ -1,3 +1,4 @@
+// Policy plugin module implements register behavior.
 import { basename, isAbsolute, resolve } from "node:path";
 import JSON5 from "json5";
 import {
@@ -15,11 +16,20 @@ import {
   policyDocumentHash,
   type PolicyAuthProfileEvidence,
   type PolicyAgentWorkspaceEvidence,
+  type PolicyDataHandlingEvidence,
   type PolicyEvidence,
+  type PolicyIngressEvidence,
   type PolicySandboxPostureEvidence,
   type PolicyToolPostureEvidence,
 } from "../policy-state.js";
 import { POLICY_TOOL_GROUPS } from "../tool-policy-conformance.js";
+
+let fsPromisesModulePromise: Promise<typeof import("node:fs/promises")> | null = null;
+
+const loadFsPromisesModule = async () => {
+  fsPromisesModulePromise ??= import("node:fs/promises");
+  return await fsPromisesModulePromise;
+};
 
 const CHECK_IDS = {
   policyAttestationMismatch: "policy/attestation-hash-mismatch",
@@ -32,6 +42,10 @@ const CHECK_IDS = {
   policyDeniedModelProvider: "policy/models-denied-provider",
   policyUnapprovedModelProvider: "policy/models-unapproved-provider",
   policyPrivateNetworkAccess: "policy/network-private-access-enabled",
+  policyIngressDmPolicyUnapproved: "policy/ingress-dm-policy-unapproved",
+  policyIngressDmScopeUnapproved: "policy/ingress-dm-scope-unapproved",
+  policyIngressOpenGroupsDenied: "policy/ingress-open-groups-denied",
+  policyIngressGroupMentionRequired: "policy/ingress-group-mention-required",
   policyGatewayNonLoopbackBind: "policy/gateway-non-loopback-bind",
   policyGatewayAuthDisabled: "policy/gateway-auth-disabled",
   policyGatewayRateLimitMissing: "policy/gateway-rate-limit-missing",
@@ -60,6 +74,12 @@ const CHECK_IDS = {
   policySandboxContainerRuntimeSocketMount: "policy/sandbox-container-runtime-socket-mount",
   policySandboxContainerUnconfinedProfile: "policy/sandbox-container-unconfined-profile",
   policySandboxBrowserCdpSourceRangeMissing: "policy/sandbox-browser-cdp-source-range-missing",
+  policyDataHandlingRedactionDisabled: "policy/data-handling-redaction-disabled",
+  policyDataHandlingTelemetryContentCapture: "policy/data-handling-telemetry-content-capture",
+  policyDataHandlingSessionRetentionNotEnforced:
+    "policy/data-handling-session-retention-not-enforced",
+  policyDataHandlingSessionTranscriptMemory:
+    "policy/data-handling-session-transcript-memory-enabled",
   policySecretsUnmanagedProvider: "policy/secrets-unmanaged-provider",
   policySecretsDeniedProviderSource: "policy/secrets-denied-provider-source",
   policySecretsInsecureProvider: "policy/secrets-insecure-provider",
@@ -83,6 +103,10 @@ export const POLICY_CHECK_IDS = [
   CHECK_IDS.policyDeniedModelProvider,
   CHECK_IDS.policyUnapprovedModelProvider,
   CHECK_IDS.policyPrivateNetworkAccess,
+  CHECK_IDS.policyIngressDmPolicyUnapproved,
+  CHECK_IDS.policyIngressDmScopeUnapproved,
+  CHECK_IDS.policyIngressOpenGroupsDenied,
+  CHECK_IDS.policyIngressGroupMentionRequired,
   CHECK_IDS.policyGatewayNonLoopbackBind,
   CHECK_IDS.policyGatewayAuthDisabled,
   CHECK_IDS.policyGatewayRateLimitMissing,
@@ -111,6 +135,10 @@ export const POLICY_CHECK_IDS = [
   CHECK_IDS.policySandboxContainerRuntimeSocketMount,
   CHECK_IDS.policySandboxContainerUnconfinedProfile,
   CHECK_IDS.policySandboxBrowserCdpSourceRangeMissing,
+  CHECK_IDS.policyDataHandlingRedactionDisabled,
+  CHECK_IDS.policyDataHandlingTelemetryContentCapture,
+  CHECK_IDS.policyDataHandlingSessionRetentionNotEnforced,
+  CHECK_IDS.policyDataHandlingSessionTranscriptMemory,
   CHECK_IDS.policySecretsUnmanagedProvider,
   CHECK_IDS.policySecretsDeniedProviderSource,
   CHECK_IDS.policySecretsInsecureProvider,
@@ -126,21 +154,25 @@ export const POLICY_CHECK_IDS = [
 export type PolicyStrictnessKind =
   | "allowlist-subset"
   | "denylist-superset"
+  | "ordered-string"
   | "requires-true"
   | "requires-false"
   | "exact-list";
 
 export type PolicyEmptyListSemantics = "disabled" | "meaningful";
 
-export type PolicyScopeSelectorKind = "agentIds";
+export type PolicyScopeSelectorKind = "agentIds" | "channelIds";
 
 export type PolicyRuleMetadata = {
   readonly policyPath: readonly string[];
   readonly strictness: PolicyStrictnessKind;
-  readonly valueType: "boolean" | "string" | "string-list";
+  readonly valueType: "boolean" | "channel-provider-deny-rules" | "string" | "string-list";
   readonly checkIds: readonly (typeof POLICY_CHECK_IDS)[number][];
   readonly emptyList?: PolicyEmptyListSemantics;
+  readonly allowedValues?: readonly string[];
   readonly caseSensitive?: boolean;
+  readonly normalizeValues?: "model-provider";
+  readonly orderedValues?: readonly string[];
   readonly scopeSelectors?: readonly PolicyScopeSelectorKind[];
 };
 
@@ -179,6 +211,7 @@ const SANDBOX_POLICY_RULE_METADATA = [
     valueType: "string-list",
     checkIds: [CHECK_IDS.policySandboxModeUnapproved],
     emptyList: "disabled",
+    allowedValues: ["off", "non-main", "all"],
     scopeSelectors: ["agentIds"],
   },
   {
@@ -207,11 +240,113 @@ const SANDBOX_POLICY_RULE_METADATA = [
 
 export const POLICY_RULE_METADATA = [
   {
+    policyPath: ["channels", "denyRules"],
+    strictness: "denylist-superset",
+    valueType: "channel-provider-deny-rules",
+    checkIds: [CHECK_IDS.policyDeniedChannelProvider],
+    emptyList: "meaningful",
+    caseSensitive: true,
+  },
+  {
+    policyPath: ["mcp", "servers", "allow"],
+    strictness: "allowlist-subset",
+    valueType: "string-list",
+    checkIds: [CHECK_IDS.policyUnapprovedMcpServer],
+    emptyList: "disabled",
+    caseSensitive: true,
+  },
+  {
+    policyPath: ["mcp", "servers", "deny"],
+    strictness: "denylist-superset",
+    valueType: "string-list",
+    checkIds: [CHECK_IDS.policyDeniedMcpServer],
+    caseSensitive: true,
+  },
+  {
+    policyPath: ["models", "providers", "allow"],
+    strictness: "allowlist-subset",
+    valueType: "string-list",
+    checkIds: [CHECK_IDS.policyUnapprovedModelProvider],
+    emptyList: "disabled",
+    normalizeValues: "model-provider",
+  },
+  {
+    policyPath: ["models", "providers", "deny"],
+    strictness: "denylist-superset",
+    valueType: "string-list",
+    checkIds: [CHECK_IDS.policyDeniedModelProvider],
+    normalizeValues: "model-provider",
+  },
+  {
+    policyPath: ["network", "privateNetwork", "allow"],
+    strictness: "requires-false",
+    valueType: "boolean",
+    checkIds: [CHECK_IDS.policyPrivateNetworkAccess],
+  },
+  {
+    policyPath: ["ingress", "session", "requireDmScope"],
+    strictness: "ordered-string",
+    valueType: "string",
+    orderedValues: ["main", "per-peer", "per-channel-peer", "per-account-channel-peer"],
+    checkIds: [CHECK_IDS.policyIngressDmScopeUnapproved],
+  },
+  {
+    policyPath: ["gateway", "exposure", "allowNonLoopbackBind"],
+    strictness: "requires-false",
+    valueType: "boolean",
+    checkIds: [CHECK_IDS.policyGatewayNonLoopbackBind],
+  },
+  {
+    policyPath: ["gateway", "exposure", "allowTailscaleFunnel"],
+    strictness: "requires-false",
+    valueType: "boolean",
+    checkIds: [CHECK_IDS.policyGatewayTailscaleFunnel],
+  },
+  {
+    policyPath: ["gateway", "auth", "requireAuth"],
+    strictness: "requires-true",
+    valueType: "boolean",
+    checkIds: [CHECK_IDS.policyGatewayAuthDisabled],
+  },
+  {
+    policyPath: ["gateway", "auth", "requireExplicitRateLimit"],
+    strictness: "requires-true",
+    valueType: "boolean",
+    checkIds: [CHECK_IDS.policyGatewayRateLimitMissing],
+  },
+  {
+    policyPath: ["gateway", "controlUi", "allowInsecure"],
+    strictness: "requires-false",
+    valueType: "boolean",
+    checkIds: [CHECK_IDS.policyGatewayControlUiInsecure],
+  },
+  {
+    policyPath: ["gateway", "remote", "allow"],
+    strictness: "requires-false",
+    valueType: "boolean",
+    checkIds: [CHECK_IDS.policyGatewayRemoteEnabled],
+  },
+  {
+    policyPath: ["gateway", "http", "denyEndpoints"],
+    strictness: "denylist-superset",
+    valueType: "string-list",
+    checkIds: [CHECK_IDS.policyGatewayHttpEndpointEnabled],
+    allowedValues: ["chatCompletions", "responses"],
+    caseSensitive: true,
+  },
+  {
+    policyPath: ["gateway", "http", "requireUrlAllowlists"],
+    strictness: "requires-true",
+    valueType: "boolean",
+    checkIds: [CHECK_IDS.policyGatewayHttpUrlFetchUnrestricted],
+  },
+  {
     policyPath: ["agents", "workspace", "allowedAccess"],
     strictness: "allowlist-subset",
     valueType: "string-list",
     checkIds: [CHECK_IDS.policyAgentsWorkspaceAccessDenied],
     emptyList: "disabled",
+    allowedValues: ["none", "ro", "rw"],
     scopeSelectors: ["agentIds"],
   },
   {
@@ -219,6 +354,7 @@ export const POLICY_RULE_METADATA = [
     strictness: "denylist-superset",
     valueType: "string-list",
     checkIds: [CHECK_IDS.policyAgentsToolNotDenied],
+    allowedValues: ["exec", "process", "write", "edit", "apply_patch"],
     scopeSelectors: ["agentIds"],
   },
   {
@@ -227,6 +363,7 @@ export const POLICY_RULE_METADATA = [
     valueType: "string-list",
     checkIds: [CHECK_IDS.policyToolsProfileUnapproved],
     emptyList: "disabled",
+    allowedValues: ["minimal", "coding", "messaging", "full"],
     scopeSelectors: ["agentIds"],
   },
   {
@@ -242,6 +379,7 @@ export const POLICY_RULE_METADATA = [
     valueType: "string-list",
     checkIds: [CHECK_IDS.policyToolsExecSecurityUnapproved],
     emptyList: "disabled",
+    allowedValues: ["deny", "allowlist", "full"],
     scopeSelectors: ["agentIds"],
   },
   {
@@ -250,6 +388,7 @@ export const POLICY_RULE_METADATA = [
     valueType: "string-list",
     checkIds: [CHECK_IDS.policyToolsExecAskUnapproved],
     emptyList: "disabled",
+    allowedValues: ["off", "on-miss", "always"],
     scopeSelectors: ["agentIds"],
   },
   {
@@ -258,6 +397,7 @@ export const POLICY_RULE_METADATA = [
     valueType: "string-list",
     checkIds: [CHECK_IDS.policyToolsExecHostUnapproved],
     emptyList: "disabled",
+    allowedValues: ["auto", "sandbox", "gateway", "node"],
     scopeSelectors: ["agentIds"],
   },
   {
@@ -282,15 +422,138 @@ export const POLICY_RULE_METADATA = [
     checkIds: [CHECK_IDS.policyToolsRequiredDenyMissing],
     scopeSelectors: ["agentIds"],
   },
+  {
+    policyPath: ["tools", "requireMetadata"],
+    strictness: "denylist-superset",
+    valueType: "string-list",
+    checkIds: [
+      CHECK_IDS.policyMissingToolRisk,
+      CHECK_IDS.policyMissingToolSensitivity,
+      CHECK_IDS.policyMissingToolOwner,
+    ],
+    allowedValues: ["risk", "sensitivity", "owner"],
+  },
   ...SANDBOX_POLICY_RULE_METADATA,
+  {
+    policyPath: ["ingress", "channels", "allowDmPolicies"],
+    strictness: "allowlist-subset",
+    valueType: "string-list",
+    checkIds: [CHECK_IDS.policyIngressDmPolicyUnapproved],
+    emptyList: "disabled",
+    allowedValues: ["pairing", "allowlist", "open", "disabled"],
+    scopeSelectors: ["channelIds"],
+  },
+  {
+    policyPath: ["ingress", "channels", "denyOpenGroups"],
+    strictness: "requires-true",
+    valueType: "boolean",
+    checkIds: [CHECK_IDS.policyIngressOpenGroupsDenied],
+    scopeSelectors: ["channelIds"],
+  },
+  {
+    policyPath: ["ingress", "channels", "requireMentionInGroups"],
+    strictness: "requires-true",
+    valueType: "boolean",
+    checkIds: [CHECK_IDS.policyIngressGroupMentionRequired],
+    scopeSelectors: ["channelIds"],
+  },
+  {
+    policyPath: ["dataHandling", "sensitiveLogging", "requireRedaction"],
+    strictness: "requires-true",
+    valueType: "boolean",
+    checkIds: [CHECK_IDS.policyDataHandlingRedactionDisabled],
+  },
+  {
+    policyPath: ["dataHandling", "telemetry", "denyContentCapture"],
+    strictness: "requires-true",
+    valueType: "boolean",
+    checkIds: [CHECK_IDS.policyDataHandlingTelemetryContentCapture],
+  },
+  {
+    policyPath: ["dataHandling", "retention", "requireSessionMaintenance"],
+    strictness: "requires-true",
+    valueType: "boolean",
+    checkIds: [CHECK_IDS.policyDataHandlingSessionRetentionNotEnforced],
+  },
+  {
+    policyPath: ["dataHandling", "memory", "denySessionTranscriptIndexing"],
+    strictness: "requires-true",
+    valueType: "boolean",
+    checkIds: [CHECK_IDS.policyDataHandlingSessionTranscriptMemory],
+    scopeSelectors: ["agentIds"],
+  },
+  {
+    policyPath: ["secrets", "requireManagedProviders"],
+    strictness: "requires-true",
+    valueType: "boolean",
+    checkIds: [CHECK_IDS.policySecretsUnmanagedProvider],
+  },
+  {
+    policyPath: ["secrets", "denySources"],
+    strictness: "denylist-superset",
+    valueType: "string-list",
+    checkIds: [CHECK_IDS.policySecretsDeniedProviderSource],
+  },
+  {
+    policyPath: ["secrets", "allowInsecureProviders"],
+    strictness: "requires-false",
+    valueType: "boolean",
+    checkIds: [CHECK_IDS.policySecretsInsecureProvider],
+  },
+  {
+    policyPath: ["auth", "profiles", "requireMetadata"],
+    strictness: "denylist-superset",
+    valueType: "string-list",
+    checkIds: [CHECK_IDS.policyAuthProfileInvalidMetadata],
+    allowedValues: ["provider", "mode"],
+  },
+  {
+    policyPath: ["auth", "profiles", "allowModes"],
+    strictness: "allowlist-subset",
+    valueType: "string-list",
+    checkIds: [CHECK_IDS.policyAuthProfileUnapprovedMode],
+    emptyList: "disabled",
+    allowedValues: ["api_key", "aws-sdk", "oauth", "token"],
+  },
 ] as const satisfies readonly PolicyRuleMetadata[];
+
+const POLICY_RULES: readonly PolicyRuleMetadata[] = POLICY_RULE_METADATA;
 
 const KNOWN_RISK_LEVELS = ["low", "medium", "high", "critical"] as const;
 const KNOWN_SENSITIVITY_LEVELS = ["public", "internal", "confidential", "restricted"] as const;
 const SUPPORTED_TOOL_METADATA = ["risk", "sensitivity", "owner"] as const;
 const SUPPORTED_AUTH_PROFILE_METADATA = ["provider", "mode"] as const;
 const SUPPORTED_AUTH_PROFILE_MODES = ["api_key", "aws-sdk", "oauth", "token"] as const;
+const SUPPORTED_POLICY_SECTIONS = [
+  "auth",
+  "agents",
+  "channels",
+  "dataHandling",
+  "gateway",
+  "ingress",
+  "mcp",
+  "models",
+  "network",
+  "sandbox",
+  "scopes",
+  "secrets",
+  "tools",
+] as const;
+const SUPPORTED_GATEWAY_POLICY_SECTIONS = [
+  "auth",
+  "controlUi",
+  "exposure",
+  "http",
+  "remote",
+] as const;
 const SUPPORTED_GATEWAY_HTTP_ENDPOINTS = ["chatCompletions", "responses"] as const;
+const SUPPORTED_DM_POLICIES = ["pairing", "allowlist", "open", "disabled"] as const;
+const SUPPORTED_DM_SCOPES = [
+  "main",
+  "per-peer",
+  "per-channel-peer",
+  "per-account-channel-peer",
+] as const;
 const SUPPORTED_AGENT_WORKSPACE_DENY_TOOLS = [
   "exec",
   "process",
@@ -337,6 +600,10 @@ export function registerPolicyDoctorChecks(host?: PolicyDoctorRegistrationHost):
   registerHealthCheck(policyModelsDeniedProviderCheck);
   registerHealthCheck(policyModelsUnapprovedProviderCheck);
   registerHealthCheck(policyNetworkPrivateAccessCheck);
+  registerHealthCheck(policyIngressDmPolicyUnapprovedCheck);
+  registerHealthCheck(policyIngressDmScopeUnapprovedCheck);
+  registerHealthCheck(policyIngressOpenGroupsDeniedCheck);
+  registerHealthCheck(policyIngressGroupMentionRequiredCheck);
   registerHealthCheck(policyGatewayNonLoopbackBindCheck);
   registerHealthCheck(policyGatewayAuthDisabledCheck);
   registerHealthCheck(policyGatewayRateLimitMissingCheck);
@@ -365,6 +632,10 @@ export function registerPolicyDoctorChecks(host?: PolicyDoctorRegistrationHost):
   registerHealthCheck(policySandboxContainerRuntimeSocketMountCheck);
   registerHealthCheck(policySandboxContainerUnconfinedProfileCheck);
   registerHealthCheck(policySandboxBrowserCdpSourceRangeMissingCheck);
+  registerHealthCheck(policyDataHandlingRedactionDisabledCheck);
+  registerHealthCheck(policyDataHandlingTelemetryContentCaptureCheck);
+  registerHealthCheck(policyDataHandlingSessionRetentionNotEnforcedCheck);
+  registerHealthCheck(policyDataHandlingSessionTranscriptMemoryCheck);
   registerHealthCheck(policySecretsUnmanagedProviderCheck);
   registerHealthCheck(policySecretsDeniedProviderSourceCheck);
   registerHealthCheck(policySecretsInsecureProviderCheck);
@@ -514,6 +785,46 @@ const policyNetworkPrivateAccessCheck: HealthCheck = {
   source: "policy",
   async detect(ctx) {
     return findingsForCheck(await evaluatePolicy(ctx), CHECK_IDS.policyPrivateNetworkAccess);
+  },
+};
+
+const policyIngressDmPolicyUnapprovedCheck: HealthCheck = {
+  id: CHECK_IDS.policyIngressDmPolicyUnapproved,
+  kind: "plugin",
+  description: "Channel direct-message access policy matches ingress requirements.",
+  source: "policy",
+  async detect(ctx) {
+    return findingsForCheck(await evaluatePolicy(ctx), CHECK_IDS.policyIngressDmPolicyUnapproved);
+  },
+};
+
+const policyIngressDmScopeUnapprovedCheck: HealthCheck = {
+  id: CHECK_IDS.policyIngressDmScopeUnapproved,
+  kind: "plugin",
+  description: "Direct-message sessions use the policy-required isolation scope.",
+  source: "policy",
+  async detect(ctx) {
+    return findingsForCheck(await evaluatePolicy(ctx), CHECK_IDS.policyIngressDmScopeUnapproved);
+  },
+};
+
+const policyIngressOpenGroupsDeniedCheck: HealthCheck = {
+  id: CHECK_IDS.policyIngressOpenGroupsDenied,
+  kind: "plugin",
+  description: "Channel group access does not use open group policy when denied.",
+  source: "policy",
+  async detect(ctx) {
+    return findingsForCheck(await evaluatePolicy(ctx), CHECK_IDS.policyIngressOpenGroupsDenied);
+  },
+};
+
+const policyIngressGroupMentionRequiredCheck: HealthCheck = {
+  id: CHECK_IDS.policyIngressGroupMentionRequired,
+  kind: "plugin",
+  description: "Channel group access keeps mention gates enabled when required.",
+  source: "policy",
+  async detect(ctx) {
+    return findingsForCheck(await evaluatePolicy(ctx), CHECK_IDS.policyIngressGroupMentionRequired);
   },
 };
 
@@ -824,6 +1135,58 @@ const policySandboxBrowserCdpSourceRangeMissingCheck: HealthCheck = {
   },
 };
 
+const policyDataHandlingRedactionDisabledCheck: HealthCheck = {
+  id: CHECK_IDS.policyDataHandlingRedactionDisabled,
+  kind: "plugin",
+  description: "Sensitive logging redaction remains enabled when policy requires it.",
+  source: "policy",
+  async detect(ctx) {
+    return findingsForCheck(
+      await evaluatePolicy(ctx),
+      CHECK_IDS.policyDataHandlingRedactionDisabled,
+    );
+  },
+};
+
+const policyDataHandlingTelemetryContentCaptureCheck: HealthCheck = {
+  id: CHECK_IDS.policyDataHandlingTelemetryContentCapture,
+  kind: "plugin",
+  description: "Telemetry content capture remains disabled when policy denies it.",
+  source: "policy",
+  async detect(ctx) {
+    return findingsForCheck(
+      await evaluatePolicy(ctx),
+      CHECK_IDS.policyDataHandlingTelemetryContentCapture,
+    );
+  },
+};
+
+const policyDataHandlingSessionRetentionNotEnforcedCheck: HealthCheck = {
+  id: CHECK_IDS.policyDataHandlingSessionRetentionNotEnforced,
+  kind: "plugin",
+  description: "Session retention maintenance is enforced when policy requires it.",
+  source: "policy",
+  async detect(ctx) {
+    return findingsForCheck(
+      await evaluatePolicy(ctx),
+      CHECK_IDS.policyDataHandlingSessionRetentionNotEnforced,
+    );
+  },
+};
+
+const policyDataHandlingSessionTranscriptMemoryCheck: HealthCheck = {
+  id: CHECK_IDS.policyDataHandlingSessionTranscriptMemory,
+  kind: "plugin",
+  description: "Session transcript memory indexing remains disabled when policy denies it.",
+  source: "policy",
+  async detect(ctx) {
+    return findingsForCheck(
+      await evaluatePolicy(ctx),
+      CHECK_IDS.policyDataHandlingSessionTranscriptMemory,
+    );
+  },
+};
+
 const policySecretsUnmanagedProviderCheck: HealthCheck = {
   id: CHECK_IDS.policySecretsUnmanagedProvider,
   kind: "plugin",
@@ -931,6 +1294,7 @@ async function evaluatePolicyUncached(ctx: HealthCheckContext): Promise<PolicyEv
   const settings = policySettings(ctx);
   const policyPath = policyDisplayName(ctx);
   let evidence: PolicyEvidence = collectPolicyEvidence(ctx.cfg as Record<string, unknown>, {
+    includeIngress: false,
     includeGatewayExposure: false,
     includeAgentWorkspace: false,
     includeToolPosture: false,
@@ -1023,15 +1387,19 @@ async function evaluatePolicyUncached(ctx: HealthCheckContext): Promise<PolicyEv
     metadataRequirementFindings.length === 0 ? requiredToolMetadata(policy) : new Set<string>();
   const includeSecrets = policyHasSecretRules(policy);
   const includeAuthProfiles = policyHasAuthProfileRules(policy);
+  const includeIngress = policyHasIngressRules(policy);
   const includeGatewayExposure = policyHasGatewayRules(policy);
   const includeAgentWorkspace = policyHasAgentWorkspaceRules(policy);
+  const includeDataHandling = policyHasDataHandlingRules(policy);
   const includeSandboxPosture = policyHasSandboxPostureRules(policy);
   if (requiredMetadata.size > 0) {
     const toolsFile = await readWorkspaceFile(ctx, "TOOLS.md");
     evidence = await collectPolicyEvidence(ctx.cfg as Record<string, unknown>, {
       toolsRaw: toolsFile?.raw ?? "",
+      includeIngress,
       includeGatewayExposure,
       includeAgentWorkspace,
+      includeDataHandling,
       includeToolPosture: policyHasToolPostureRules(policy),
       includeSandboxPosture,
       includeSecrets,
@@ -1039,8 +1407,10 @@ async function evaluatePolicyUncached(ctx: HealthCheckContext): Promise<PolicyEv
     });
   } else {
     evidence = collectPolicyEvidence(ctx.cfg as Record<string, unknown>, {
+      includeIngress,
       includeGatewayExposure,
       includeAgentWorkspace,
+      includeDataHandling,
       includeToolPosture: policyHasToolPostureRules(policy),
       includeSandboxPosture,
       includeSecrets,
@@ -1053,10 +1423,12 @@ async function evaluatePolicyUncached(ctx: HealthCheckContext): Promise<PolicyEv
     ...mcpServerFindings(policy, policyFile.ocDocName, evidence),
     ...modelProviderFindings(policy, policyFile.ocDocName, evidence),
     ...networkFindings(policy, policyFile.ocDocName, evidence),
+    ...ingressFindings(policy, policyFile.displayName, policyFile.ocDocName, evidence),
     ...gatewayExposureFindings(policy, policyFile.ocDocName, evidence),
     ...agentWorkspaceFindings(policy, policyFile.displayName, policyFile.ocDocName, evidence),
     ...toolPostureFindings(policy, policyFile.displayName, policyFile.ocDocName, evidence),
     ...sandboxPostureFindings(policy, policyFile.displayName, policyFile.ocDocName, evidence),
+    ...dataHandlingFindings(policy, policyFile.displayName, policyFile.ocDocName, evidence),
     ...secretAuthProvenanceFindings(policy, policyFile.displayName, policyFile.ocDocName, evidence),
     ...authMetadataRequirementFindings,
     ...metadataRequirementFindings,
@@ -1259,7 +1631,7 @@ function toolMetadataRequirementFindings(
   ];
 }
 
-function policyContainerShapeFindings(
+export function policyContainerShapeFindings(
   policy: unknown,
   policyPath: string,
   policyDocName: string,
@@ -1274,6 +1646,17 @@ function policyContainerShapeFindings(
       ),
     ];
   }
+  const unsupportedTopLevel = unsupportedPolicyKey(policy, SUPPORTED_POLICY_SECTIONS);
+  if (unsupportedTopLevel !== undefined) {
+    return [
+      policyShapeFinding(
+        policyPath,
+        `oc://${policyDocName}/${ocPathSegment(unsupportedTopLevel)}`,
+        `${policyPath} ${unsupportedTopLevel} is not a supported policy section.`,
+        `Remove ${unsupportedTopLevel} or use a supported policy section.`,
+      ),
+    ];
+  }
   if (policy.tools !== undefined && !isRecord(policy.tools)) {
     return [
       policyShapeFinding(
@@ -1285,26 +1668,6 @@ function policyContainerShapeFindings(
     ];
   }
   if (isRecord(policy.tools)) {
-    if (policy.tools.settings !== undefined && !isRecord(policy.tools.settings)) {
-      return [
-        policyShapeFinding(
-          policyPath,
-          `oc://${policyDocName}/tools/settings`,
-          `${policyPath} tools.settings must be an object.`,
-          `Fix ${policyPath} so tools.settings is an object.`,
-        ),
-      ];
-    }
-    if (policy.tools.entries !== undefined && !Array.isArray(policy.tools.entries)) {
-      return [
-        policyShapeFinding(
-          policyPath,
-          `oc://${policyDocName}/tools/entries`,
-          `${policyPath} tools.entries must be an array.`,
-          `Fix ${policyPath} so tools.entries is an array.`,
-        ),
-      ];
-    }
     const postureFinding = toolPosturePolicyShapeFinding(policy.tools, {
       policyDocName,
       policyPath,
@@ -1323,6 +1686,19 @@ function policyContainerShapeFindings(
       ),
     ];
   }
+  if (isRecord(policy.channels)) {
+    const unsupportedChannelKey = unsupportedPolicyKey(policy.channels, ["denyRules"]);
+    if (unsupportedChannelKey !== undefined) {
+      return [
+        policyShapeFinding(
+          policyPath,
+          `oc://${policyDocName}/channels/${ocPathSegment(unsupportedChannelKey)}`,
+          `${policyPath} channels.${unsupportedChannelKey} is not supported in channel policy.`,
+          `Remove channels.${unsupportedChannelKey} or use channels.denyRules.`,
+        ),
+      ];
+    }
+  }
   if (policy.mcp !== undefined && !isRecord(policy.mcp)) {
     return [
       policyShapeFinding(
@@ -1330,6 +1706,29 @@ function policyContainerShapeFindings(
         `oc://${policyDocName}/mcp`,
         `${policyPath} mcp must be an object.`,
         `Fix ${policyPath} so mcp is an object.`,
+      ),
+    ];
+  }
+  if (isRecord(policy.mcp)) {
+    const unsupportedMcpKey = unsupportedPolicyKey(policy.mcp, ["servers"]);
+    if (unsupportedMcpKey !== undefined) {
+      return [
+        policyShapeFinding(
+          policyPath,
+          `oc://${policyDocName}/mcp/${ocPathSegment(unsupportedMcpKey)}`,
+          `${policyPath} mcp.${unsupportedMcpKey} is not supported in MCP policy.`,
+          `Remove mcp.${unsupportedMcpKey} or use mcp.servers.`,
+        ),
+      ];
+    }
+  }
+  if (policy.dataHandling !== undefined && !isRecord(policy.dataHandling)) {
+    return [
+      policyShapeFinding(
+        policyPath,
+        `oc://${policyDocName}/dataHandling`,
+        `${policyPath} dataHandling must be an object.`,
+        `Fix ${policyPath} so dataHandling is an object.`,
       ),
     ];
   }
@@ -1356,6 +1755,19 @@ function policyContainerShapeFindings(
     ];
   }
   if (isRecord(policy.models)) {
+    const unsupportedModelsKey = unsupportedPolicyKey(policy.models, ["providers"]);
+    if (unsupportedModelsKey !== undefined) {
+      return [
+        policyShapeFinding(
+          policyPath,
+          `oc://${policyDocName}/models/${ocPathSegment(unsupportedModelsKey)}`,
+          `${policyPath} models.${unsupportedModelsKey} is not supported in model policy.`,
+          `Remove models.${unsupportedModelsKey} or use models.providers.`,
+        ),
+      ];
+    }
+  }
+  if (isRecord(policy.models)) {
     const finding = policyStringArrayShapeFinding(policy.models.providers, {
       property: "models.providers",
       policyDocName,
@@ -1378,6 +1790,17 @@ function policyContainerShapeFindings(
     ];
   }
   if (isRecord(policy.network)) {
+    const unsupportedNetworkKey = unsupportedPolicyKey(policy.network, ["privateNetwork"]);
+    if (unsupportedNetworkKey !== undefined) {
+      return [
+        policyShapeFinding(
+          policyPath,
+          `oc://${policyDocName}/network/${ocPathSegment(unsupportedNetworkKey)}`,
+          `${policyPath} network.${unsupportedNetworkKey} is not supported in network policy.`,
+          `Remove network.${unsupportedNetworkKey} or use network.privateNetwork.`,
+        ),
+      ];
+    }
     if (policy.network.privateNetwork !== undefined && !isRecord(policy.network.privateNetwork)) {
       return [
         policyShapeFinding(
@@ -1387,6 +1810,21 @@ function policyContainerShapeFindings(
           `Fix ${policyPath} so network.privateNetwork is an object.`,
         ),
       ];
+    }
+    if (isRecord(policy.network.privateNetwork)) {
+      const unsupportedPrivateNetworkKey = unsupportedPolicyKey(policy.network.privateNetwork, [
+        "allow",
+      ]);
+      if (unsupportedPrivateNetworkKey !== undefined) {
+        return [
+          policyShapeFinding(
+            policyPath,
+            `oc://${policyDocName}/network/privateNetwork/${ocPathSegment(unsupportedPrivateNetworkKey)}`,
+            `${policyPath} network.privateNetwork.${unsupportedPrivateNetworkKey} is not supported in network policy.`,
+            `Remove network.privateNetwork.${unsupportedPrivateNetworkKey} or use network.privateNetwork.allow.`,
+          ),
+        ];
+      }
     }
     if (
       isRecord(policy.network.privateNetwork) &&
@@ -1413,6 +1851,23 @@ function policyContainerShapeFindings(
       ),
     ];
   }
+  if (isRecord(policy.secrets)) {
+    const unsupportedSecretsKey = unsupportedPolicyKey(policy.secrets, [
+      "allowInsecureProviders",
+      "denySources",
+      "requireManagedProviders",
+    ]);
+    if (unsupportedSecretsKey !== undefined) {
+      return [
+        policyShapeFinding(
+          policyPath,
+          `oc://${policyDocName}/secrets/${ocPathSegment(unsupportedSecretsKey)}`,
+          `${policyPath} secrets.${unsupportedSecretsKey} is not supported in secrets policy.`,
+          `Remove secrets.${unsupportedSecretsKey} or use a supported secrets policy rule.`,
+        ),
+      ];
+    }
+  }
   if (policy.auth !== undefined && !isRecord(policy.auth)) {
     return [
       policyShapeFinding(
@@ -1422,6 +1877,19 @@ function policyContainerShapeFindings(
         `Fix ${policyPath} so auth is an object.`,
       ),
     ];
+  }
+  if (isRecord(policy.auth)) {
+    const unsupportedAuthKey = unsupportedPolicyKey(policy.auth, ["profiles"]);
+    if (unsupportedAuthKey !== undefined) {
+      return [
+        policyShapeFinding(
+          policyPath,
+          `oc://${policyDocName}/auth/${ocPathSegment(unsupportedAuthKey)}`,
+          `${policyPath} auth.${unsupportedAuthKey} is not supported in auth policy.`,
+          `Remove auth.${unsupportedAuthKey} or use auth.profiles.`,
+        ),
+      ];
+    }
   }
   if (
     isRecord(policy.auth) &&
@@ -1437,12 +1905,35 @@ function policyContainerShapeFindings(
       ),
     ];
   }
+  if (isRecord(policy.auth) && isRecord(policy.auth.profiles)) {
+    const unsupportedProfilesKey = unsupportedPolicyKey(policy.auth.profiles, [
+      "allowModes",
+      "requireMetadata",
+    ]);
+    if (unsupportedProfilesKey !== undefined) {
+      return [
+        policyShapeFinding(
+          policyPath,
+          `oc://${policyDocName}/auth/profiles/${ocPathSegment(unsupportedProfilesKey)}`,
+          `${policyPath} auth.profiles.${unsupportedProfilesKey} is not supported in auth profile policy.`,
+          `Remove auth.profiles.${unsupportedProfilesKey} or use a supported auth profile policy rule.`,
+        ),
+      ];
+    }
+  }
   const sandboxFinding = sandboxPolicyShapeFinding(policy.sandbox, {
     policyDocName,
     policyPath,
   });
   if (sandboxFinding !== undefined) {
     return [sandboxFinding];
+  }
+  const ingressFindingValue = ingressPolicyShapeFinding(policy.ingress, {
+    policyDocName,
+    policyPath,
+  });
+  if (ingressFindingValue !== undefined) {
+    return [ingressFindingValue];
   }
   const gatewayFinding = gatewayPolicyShapeFinding(policy.gateway, {
     policyDocName,
@@ -1469,6 +1960,116 @@ function policyContainerShapeFindings(
   return [];
 }
 
+function ingressPolicyShapeFinding(
+  value: unknown,
+  params: {
+    readonly policyDocName: string;
+    readonly policyPath: string;
+    readonly targetPrefix?: string;
+    readonly propertyPrefix?: string;
+    readonly allowSession?: boolean;
+  },
+): HealthFinding | undefined {
+  const targetPrefix = params.targetPrefix ?? "ingress";
+  const propertyPrefix = params.propertyPrefix ?? "ingress";
+  const allowSession = params.allowSession ?? true;
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!isRecord(value)) {
+    return policyShapeFinding(
+      params.policyPath,
+      `oc://${params.policyDocName}/${targetPrefix}`,
+      `${params.policyPath} ${propertyPrefix} must be an object.`,
+      `Fix ${params.policyPath} so ${propertyPrefix} is an object.`,
+    );
+  }
+  if (!allowSession && value.session !== undefined) {
+    return policyShapeFinding(
+      params.policyPath,
+      `oc://${params.policyDocName}/${targetPrefix}/session`,
+      `${params.policyPath} ${propertyPrefix}.session is not supported by the channelIds selector.`,
+      `Move session ingress rules to top-level ingress; scoped ingress currently supports ingress.channels.*.`,
+    );
+  }
+  const unsupportedIngressKey = unsupportedPolicyKey(value, ["channels", "session"]);
+  if (unsupportedIngressKey !== undefined) {
+    return policyShapeFinding(
+      params.policyPath,
+      `oc://${params.policyDocName}/${targetPrefix}/${ocPathSegment(unsupportedIngressKey)}`,
+      `${params.policyPath} ${propertyPrefix}.${unsupportedIngressKey} is not supported in ingress policy.`,
+      `Remove ${propertyPrefix}.${unsupportedIngressKey} or use ingress.session or ingress.channels.`,
+    );
+  }
+  for (const section of ["session", "channels"] as const) {
+    if (value[section] !== undefined && !isRecord(value[section])) {
+      return policyShapeFinding(
+        params.policyPath,
+        `oc://${params.policyDocName}/${targetPrefix}/${section}`,
+        `${params.policyPath} ${propertyPrefix}.${section} must be an object.`,
+        `Fix ${params.policyPath} so ${propertyPrefix}.${section} is an object.`,
+      );
+    }
+  }
+  const session = isRecord(value.session) ? value.session : {};
+  const unsupportedSessionKey = unsupportedPolicyKey(session, ["requireDmScope"]);
+  if (unsupportedSessionKey !== undefined) {
+    return policyShapeFinding(
+      params.policyPath,
+      `oc://${params.policyDocName}/${targetPrefix}/session/${ocPathSegment(unsupportedSessionKey)}`,
+      `${params.policyPath} ${propertyPrefix}.session.${unsupportedSessionKey} is not supported in ingress policy.`,
+      `Remove ${propertyPrefix}.session.${unsupportedSessionKey} or use ${propertyPrefix}.session.requireDmScope.`,
+    );
+  }
+  if (
+    session.requireDmScope !== undefined &&
+    !SUPPORTED_DM_SCOPES.includes(session.requireDmScope as (typeof SUPPORTED_DM_SCOPES)[number])
+  ) {
+    return policyShapeFinding(
+      params.policyPath,
+      `oc://${params.policyDocName}/${targetPrefix}/session/requireDmScope`,
+      `${params.policyPath} ${propertyPrefix}.session.requireDmScope must be a supported DM scope.`,
+      `Use supported DM scopes: ${SUPPORTED_DM_SCOPES.join(", ")}.`,
+    );
+  }
+  const channels = isRecord(value.channels) ? value.channels : {};
+  const unsupportedChannelsKey = unsupportedPolicyKey(channels, [
+    "allowDmPolicies",
+    "denyOpenGroups",
+    "requireMentionInGroups",
+  ]);
+  if (unsupportedChannelsKey !== undefined) {
+    return policyShapeFinding(
+      params.policyPath,
+      `oc://${params.policyDocName}/${targetPrefix}/channels/${ocPathSegment(unsupportedChannelsKey)}`,
+      `${params.policyPath} ${propertyPrefix}.channels.${unsupportedChannelsKey} is not supported in ingress policy.`,
+      `Remove ${propertyPrefix}.channels.${unsupportedChannelsKey} or use a supported ingress channel policy rule.`,
+    );
+  }
+  const allowDmPoliciesFinding = policyStringArrayPropertyShapeFinding(channels.allowDmPolicies, {
+    allowed: SUPPORTED_DM_POLICIES,
+    policyDocName: params.policyDocName,
+    policyPath: params.policyPath,
+    property: `${propertyPrefix}.channels.allowDmPolicies`,
+    target: `${targetPrefix}/channels/allowDmPolicies`,
+    valueName: "DM policy",
+  });
+  if (allowDmPoliciesFinding !== undefined) {
+    return allowDmPoliciesFinding;
+  }
+  for (const key of ["denyOpenGroups", "requireMentionInGroups"] as const) {
+    if (channels[key] !== undefined && typeof channels[key] !== "boolean") {
+      return policyShapeFinding(
+        params.policyPath,
+        `oc://${params.policyDocName}/${targetPrefix}/channels/${key}`,
+        `${params.policyPath} ${propertyPrefix}.channels.${key} must be a boolean.`,
+        `Set ${propertyPrefix}.channels.${key} to true or false.`,
+      );
+    }
+  }
+  return undefined;
+}
+
 function agentsPolicyShapeFinding(
   value: unknown,
   params: {
@@ -1485,6 +2086,15 @@ function agentsPolicyShapeFinding(
       `oc://${params.policyDocName}/agents`,
       `${params.policyPath} agents must be an object.`,
       `Fix ${params.policyPath} so agents is an object.`,
+    );
+  }
+  const unsupportedAgentsKey = unsupportedPolicyKey(value, ["workspace"]);
+  if (unsupportedAgentsKey !== undefined) {
+    return policyShapeFinding(
+      params.policyPath,
+      `oc://${params.policyDocName}/agents/${ocPathSegment(unsupportedAgentsKey)}`,
+      `${params.policyPath} agents.${unsupportedAgentsKey} is not supported in agents policy.`,
+      `Remove agents.${unsupportedAgentsKey} or use agents.workspace.`,
     );
   }
   const workspaceFinding = agentWorkspacePolicyShapeFinding(value.workspace, {
@@ -1528,61 +2138,96 @@ function scopedPolicyShapeFinding(
         `Fix ${params.policyPath} so the named policy scope is an object.`,
       );
     }
-    if (overlay.agentIds === undefined) {
+    const hasAgentIds = overlay.agentIds !== undefined;
+    const hasChannelIds = overlay.channelIds !== undefined;
+    if (!hasAgentIds && !hasChannelIds) {
       return policyShapeFinding(
         params.policyPath,
-        `oc://${params.policyDocName}/${targetPrefix}/agentIds`,
-        `${params.policyPath} scopes.${scopeName}.agentIds is required for scoped policy.`,
-        `List the runtime agent ids that this named policy scope applies to.`,
+        `oc://${params.policyDocName}/${targetPrefix}`,
+        `${params.policyPath} scopes.${scopeName} must define at least one selector.`,
+        `List agentIds for agent-scoped policy or channelIds for channel-scoped ingress policy.`,
       );
     }
-    const agentIdsFinding = policyStringArrayPropertyShapeFinding(overlay.agentIds, {
+    const agentIdsFinding = scopedSelectorShapeFinding(overlay.agentIds, {
       policyDocName: params.policyDocName,
       policyPath: params.policyPath,
       property: `scopes.${scopeName}.agentIds`,
       target: `${targetPrefix}/agentIds`,
       valueName: "agent id",
+      normalize: normalizeAgentId,
     });
     if (agentIdsFinding !== undefined) {
       return agentIdsFinding;
     }
-    if (Array.isArray(overlay.agentIds) && overlay.agentIds.length === 0) {
+    const channelIdsFinding = scopedSelectorShapeFinding(overlay.channelIds, {
+      policyDocName: params.policyDocName,
+      policyPath: params.policyPath,
+      property: `scopes.${scopeName}.channelIds`,
+      target: `${targetPrefix}/channelIds`,
+      valueName: "channel id",
+      normalize: normalizePolicyChannelId,
+    });
+    if (channelIdsFinding !== undefined) {
+      return channelIdsFinding;
+    }
+    if (overlay.ingress !== undefined && !hasChannelIds) {
       return policyShapeFinding(
         params.policyPath,
-        `oc://${params.policyDocName}/${targetPrefix}/agentIds`,
-        `${params.policyPath} scopes.${scopeName}.agentIds must include at least one agent id.`,
-        `Add one or more runtime agent ids to ${params.policyPath} scopes.${scopeName}.agentIds.`,
+        `oc://${params.policyDocName}/${targetPrefix}/ingress`,
+        `${params.policyPath} scopes.${scopeName}.ingress requires the channelIds selector.`,
+        `Move global ingress rules to top-level ingress, or list channelIds for channel-scoped ingress policy.`,
       );
     }
-    if (Array.isArray(overlay.agentIds)) {
-      const seen = new Map<string, number>();
-      for (const [index, agentId] of overlay.agentIds.entries()) {
-        if (typeof agentId !== "string") {
-          continue;
-        }
-        const normalized = normalizeAgentId(agentId);
-        const previous = seen.get(normalized);
-        if (previous !== undefined) {
-          return policyShapeFinding(
-            params.policyPath,
-            `oc://${params.policyDocName}/${targetPrefix}/agentIds/#${index}`,
-            `${params.policyPath} scopes.${scopeName}.agentIds[${index}] duplicates agentIds[${previous}] after normalization.`,
-            `List each runtime agent id only once per named policy scope.`,
-          );
-        }
-        seen.set(normalized, index);
-      }
+    if (
+      (overlay.agents !== undefined ||
+        overlay.dataHandling !== undefined ||
+        overlay.tools !== undefined ||
+        overlay.sandbox !== undefined) &&
+      !hasAgentIds
+    ) {
+      return policyShapeFinding(
+        params.policyPath,
+        `oc://${params.policyDocName}/${targetPrefix}`,
+        `${params.policyPath} scopes.${scopeName} uses agent-scoped sections without agentIds.`,
+        `List agentIds for agents.workspace, dataHandling.memory, tools, or sandbox policy sections.`,
+      );
     }
     const unsupportedKey = Object.keys(overlay).find(
-      (key) => key !== "agentIds" && key !== "agents" && key !== "tools" && key !== "sandbox",
+      (key) =>
+        key !== "agentIds" &&
+        key !== "channelIds" &&
+        key !== "agents" &&
+        key !== "dataHandling" &&
+        key !== "tools" &&
+        key !== "sandbox" &&
+        key !== "ingress",
     );
     if (unsupportedKey !== undefined) {
       return policyShapeFinding(
         params.policyPath,
         `oc://${params.policyDocName}/${targetPrefix}/${ocPathSegment(unsupportedKey)}`,
-        `${params.policyPath} scopes.${scopeName}.${unsupportedKey} is not supported by the agentIds selector.`,
-        `Use only agentIds with agents.workspace, tools, or sandbox in this policy scope.`,
+        `${params.policyPath} scopes.${scopeName}.${unsupportedKey} is not a supported scoped policy section.`,
+        `Use agentIds with agents.workspace, dataHandling.memory, tools, or sandbox, and channelIds with ingress.channels.`,
       );
+    }
+    if (overlay.dataHandling !== undefined && !isRecord(overlay.dataHandling)) {
+      return policyShapeFinding(
+        params.policyPath,
+        `oc://${params.policyDocName}/${targetPrefix}/dataHandling`,
+        `${params.policyPath} scopes.${scopeName}.dataHandling must be an object.`,
+        `Fix ${params.policyPath} so the scoped dataHandling policy section is an object.`,
+      );
+    }
+    if (isRecord(overlay.dataHandling)) {
+      const scopedDataHandlingFinding = scopedDataHandlingPolicyShapeFinding(overlay.dataHandling, {
+        policyPath: params.policyPath,
+        policyDocName: params.policyDocName,
+        targetPrefix,
+        scopeName,
+      });
+      if (scopedDataHandlingFinding !== undefined) {
+        return scopedDataHandlingFinding;
+      }
     }
     if (overlay.agents !== undefined && !isRecord(overlay.agents)) {
       return policyShapeFinding(
@@ -1639,12 +2284,130 @@ function scopedPolicyShapeFinding(
     if (sandboxFinding !== undefined) {
       return sandboxFinding;
     }
+    const ingressFindingLocal = ingressPolicyShapeFinding(overlay.ingress, {
+      policyDocName: params.policyDocName,
+      policyPath: params.policyPath,
+      targetPrefix: `${targetPrefix}/ingress`,
+      propertyPrefix: `scopes.${scopeName}.ingress`,
+      allowSession: false,
+    });
+    if (ingressFindingLocal !== undefined) {
+      return ingressFindingLocal;
+    }
   }
-  return duplicateScopedAgentFieldFinding(value, {
+  return duplicateScopedPolicyFieldFinding(value, {
     policyDocName: params.policyDocName,
     policyPath: params.policyPath,
     policy: params.policy,
   });
+}
+
+function scopedDataHandlingPolicyShapeFinding(
+  dataHandling: Record<string, unknown>,
+  params: {
+    readonly policyPath: string;
+    readonly policyDocName: string;
+    readonly targetPrefix: string;
+    readonly scopeName: string;
+  },
+): HealthFinding | undefined {
+  const unsupportedKey = Object.keys(dataHandling).find((key) => key !== "memory");
+  if (unsupportedKey !== undefined) {
+    return policyShapeFinding(
+      params.policyPath,
+      `oc://${params.policyDocName}/${params.targetPrefix}/dataHandling/${ocPathSegment(unsupportedKey)}`,
+      `${params.policyPath} scopes.${params.scopeName}.dataHandling.${unsupportedKey} is not a supported scoped policy section.`,
+      `Move global data-handling rules to top-level dataHandling, or use dataHandling.memory with agentIds.`,
+    );
+  }
+  if (dataHandling.memory !== undefined && !isRecord(dataHandling.memory)) {
+    return policyShapeFinding(
+      params.policyPath,
+      `oc://${params.policyDocName}/${params.targetPrefix}/dataHandling/memory`,
+      `${params.policyPath} scopes.${params.scopeName}.dataHandling.memory must be an object.`,
+      `Fix ${params.policyPath} so the scoped dataHandling.memory policy section is an object.`,
+    );
+  }
+  if (!isRecord(dataHandling.memory)) {
+    return undefined;
+  }
+  const unsupportedMemoryKey = Object.keys(dataHandling.memory).find(
+    (key) => key !== "denySessionTranscriptIndexing",
+  );
+  if (unsupportedMemoryKey !== undefined) {
+    return policyShapeFinding(
+      params.policyPath,
+      `oc://${params.policyDocName}/${params.targetPrefix}/dataHandling/memory/${ocPathSegment(unsupportedMemoryKey)}`,
+      `${params.policyPath} scopes.${params.scopeName}.dataHandling.memory.${unsupportedMemoryKey} is not a supported scoped policy rule.`,
+      `Use dataHandling.memory.denySessionTranscriptIndexing or remove the unsupported rule.`,
+    );
+  }
+  if (
+    dataHandling.memory.denySessionTranscriptIndexing !== undefined &&
+    typeof dataHandling.memory.denySessionTranscriptIndexing !== "boolean"
+  ) {
+    return policyShapeFinding(
+      params.policyPath,
+      `oc://${params.policyDocName}/${params.targetPrefix}/dataHandling/memory/denySessionTranscriptIndexing`,
+      `${params.policyPath} scopes.${params.scopeName}.dataHandling.memory.denySessionTranscriptIndexing must be a boolean.`,
+      `Set dataHandling.memory.denySessionTranscriptIndexing to true or false.`,
+    );
+  }
+  return undefined;
+}
+
+function scopedSelectorShapeFinding(
+  value: unknown,
+  params: {
+    readonly policyDocName: string;
+    readonly policyPath: string;
+    readonly property: string;
+    readonly target: string;
+    readonly valueName: string;
+    readonly normalize: (value: string) => string;
+  },
+): HealthFinding | undefined {
+  const selectorFinding = policyStringArrayPropertyShapeFinding(value, {
+    policyDocName: params.policyDocName,
+    policyPath: params.policyPath,
+    property: params.property,
+    target: params.target,
+    valueName: params.valueName,
+  });
+  if (selectorFinding !== undefined) {
+    return selectorFinding;
+  }
+  if (value === undefined) {
+    return undefined;
+  }
+  if (Array.isArray(value) && value.length === 0) {
+    return policyShapeFinding(
+      params.policyPath,
+      `oc://${params.policyDocName}/${params.target}`,
+      `${params.policyPath} ${params.property} must include at least one ${params.valueName}.`,
+      `Add one or more ${params.valueName}s to ${params.policyPath} ${params.property}.`,
+    );
+  }
+  if (Array.isArray(value)) {
+    const seen = new Map<string, number>();
+    for (const [index, rawValue] of value.entries()) {
+      if (typeof rawValue !== "string") {
+        continue;
+      }
+      const normalized = params.normalize(rawValue);
+      const previous = seen.get(normalized);
+      if (previous !== undefined) {
+        return policyShapeFinding(
+          params.policyPath,
+          `oc://${params.policyDocName}/${params.target}/#${index}`,
+          `${params.policyPath} ${params.property}[${index}] duplicates ${params.property}[${previous}] after normalization.`,
+          `List each ${params.valueName} only once per named policy scope.`,
+        );
+      }
+      seen.set(normalized, index);
+    }
+  }
+  return undefined;
 }
 
 function scopedToolsPolicyShapeFinding(
@@ -1711,6 +2474,15 @@ function agentWorkspacePolicyShapeFinding(
       `Fix ${params.policyPath} so ${params.propertyPrefix} is an object.`,
     );
   }
+  const unsupportedWorkspaceKey = unsupportedPolicyKey(value, ["allowedAccess", "denyTools"]);
+  if (unsupportedWorkspaceKey !== undefined) {
+    return policyShapeFinding(
+      params.policyPath,
+      `oc://${params.policyDocName}/${params.targetPrefix}/${ocPathSegment(unsupportedWorkspaceKey)}`,
+      `${params.policyPath} ${params.propertyPrefix}.${unsupportedWorkspaceKey} is not supported in agent workspace policy.`,
+      `Remove ${params.propertyPrefix}.${unsupportedWorkspaceKey} or use a supported agent workspace policy rule.`,
+    );
+  }
   const allowedAccess = value.allowedAccess;
   if (allowedAccess !== undefined && !Array.isArray(allowedAccess)) {
     return policyShapeFinding(
@@ -1773,6 +2545,24 @@ function toolPosturePolicyShapeFinding(
 ): HealthFinding | undefined {
   const targetPrefix = params.targetPrefix ?? "tools";
   const propertyPrefix = params.propertyPrefix ?? "tools";
+  const allowedTopLevel = [
+    "alsoAllow",
+    "denyTools",
+    "elevated",
+    "exec",
+    "fs",
+    "profiles",
+    "requireMetadata",
+  ];
+  const unsupportedTopLevel = unsupportedPolicyKey(tools, allowedTopLevel);
+  if (unsupportedTopLevel !== undefined) {
+    return policyShapeFinding(
+      params.policyPath,
+      `oc://${params.policyDocName}/${targetPrefix}/${ocPathSegment(unsupportedTopLevel)}`,
+      `${params.policyPath} ${propertyPrefix}.${unsupportedTopLevel} is not supported in tools policy.`,
+      `Remove ${propertyPrefix}.${unsupportedTopLevel} or use a supported tools policy rule.`,
+    );
+  }
   for (const section of ["profiles", "fs", "exec", "elevated", "alsoAllow"] as const) {
     if (tools[section] !== undefined && !isRecord(tools[section])) {
       return policyShapeFinding(
@@ -1785,6 +2575,15 @@ function toolPosturePolicyShapeFinding(
   }
 
   const profiles = isRecord(tools.profiles) ? tools.profiles : {};
+  const unsupportedProfileKey = unsupportedPolicyKey(profiles, ["allow"]);
+  if (unsupportedProfileKey !== undefined) {
+    return policyShapeFinding(
+      params.policyPath,
+      `oc://${params.policyDocName}/${targetPrefix}/profiles/${ocPathSegment(unsupportedProfileKey)}`,
+      `${params.policyPath} ${propertyPrefix}.profiles.${unsupportedProfileKey} is not supported in tools policy.`,
+      `Remove ${propertyPrefix}.profiles.${unsupportedProfileKey} or use ${propertyPrefix}.profiles.allow.`,
+    );
+  }
   const profileAllowFinding = policyStringArrayPropertyShapeFinding(profiles.allow, {
     allowed: SUPPORTED_TOOL_PROFILES,
     policyDocName: params.policyDocName,
@@ -1798,6 +2597,15 @@ function toolPosturePolicyShapeFinding(
   }
 
   const fs = isRecord(tools.fs) ? tools.fs : {};
+  const unsupportedFsKey = unsupportedPolicyKey(fs, ["requireWorkspaceOnly"]);
+  if (unsupportedFsKey !== undefined) {
+    return policyShapeFinding(
+      params.policyPath,
+      `oc://${params.policyDocName}/${targetPrefix}/fs/${ocPathSegment(unsupportedFsKey)}`,
+      `${params.policyPath} ${propertyPrefix}.fs.${unsupportedFsKey} is not supported in tools policy.`,
+      `Remove ${propertyPrefix}.fs.${unsupportedFsKey} or use ${propertyPrefix}.fs.requireWorkspaceOnly.`,
+    );
+  }
   if (fs.requireWorkspaceOnly !== undefined && typeof fs.requireWorkspaceOnly !== "boolean") {
     return policyShapeFinding(
       params.policyPath,
@@ -1808,6 +2616,19 @@ function toolPosturePolicyShapeFinding(
   }
 
   const exec = isRecord(tools.exec) ? tools.exec : {};
+  const unsupportedExecKey = unsupportedPolicyKey(exec, [
+    "allowHosts",
+    "allowSecurity",
+    "requireAsk",
+  ]);
+  if (unsupportedExecKey !== undefined) {
+    return policyShapeFinding(
+      params.policyPath,
+      `oc://${params.policyDocName}/${targetPrefix}/exec/${ocPathSegment(unsupportedExecKey)}`,
+      `${params.policyPath} ${propertyPrefix}.exec.${unsupportedExecKey} is not supported in tools policy.`,
+      `Remove ${propertyPrefix}.exec.${unsupportedExecKey} or use a supported tools exec policy rule.`,
+    );
+  }
   const execLists = [
     ["allowSecurity", SUPPORTED_TOOL_EXEC_SECURITY, "exec security mode"],
     ["requireAsk", SUPPORTED_TOOL_EXEC_ASK, "exec ask mode"],
@@ -1828,6 +2649,15 @@ function toolPosturePolicyShapeFinding(
   }
 
   const elevated = isRecord(tools.elevated) ? tools.elevated : {};
+  const unsupportedElevatedKey = unsupportedPolicyKey(elevated, ["allow"]);
+  if (unsupportedElevatedKey !== undefined) {
+    return policyShapeFinding(
+      params.policyPath,
+      `oc://${params.policyDocName}/${targetPrefix}/elevated/${ocPathSegment(unsupportedElevatedKey)}`,
+      `${params.policyPath} ${propertyPrefix}.elevated.${unsupportedElevatedKey} is not supported in tools policy.`,
+      `Remove ${propertyPrefix}.elevated.${unsupportedElevatedKey} or use ${propertyPrefix}.elevated.allow.`,
+    );
+  }
   if (elevated.allow !== undefined && typeof elevated.allow !== "boolean") {
     return policyShapeFinding(
       params.policyPath,
@@ -1838,6 +2668,15 @@ function toolPosturePolicyShapeFinding(
   }
 
   const alsoAllow = isRecord(tools.alsoAllow) ? tools.alsoAllow : {};
+  const unsupportedAlsoAllowKey = unsupportedPolicyKey(alsoAllow, ["expected"]);
+  if (unsupportedAlsoAllowKey !== undefined) {
+    return policyShapeFinding(
+      params.policyPath,
+      `oc://${params.policyDocName}/${targetPrefix}/alsoAllow/${ocPathSegment(unsupportedAlsoAllowKey)}`,
+      `${params.policyPath} ${propertyPrefix}.alsoAllow.${unsupportedAlsoAllowKey} is not supported in tools policy.`,
+      `Remove ${propertyPrefix}.alsoAllow.${unsupportedAlsoAllowKey} or use ${propertyPrefix}.alsoAllow.expected.`,
+    );
+  }
   const alsoAllowExpectedFinding = policyStringArrayPropertyShapeFinding(alsoAllow.expected, {
     policyDocName: params.policyDocName,
     policyPath: params.policyPath,
@@ -2010,12 +2849,38 @@ function gatewayPolicyShapeFinding(
       );
     }
   }
+  const unsupportedGatewayKey = unsupportedPolicyKey(value, SUPPORTED_GATEWAY_POLICY_SECTIONS);
+  if (unsupportedGatewayKey !== undefined) {
+    return policyShapeFinding(
+      params.policyPath,
+      `oc://${params.policyDocName}/gateway/${ocPathSegment(unsupportedGatewayKey)}`,
+      `${params.policyPath} gateway.${unsupportedGatewayKey} is not supported in Gateway policy.`,
+      `Remove gateway.${unsupportedGatewayKey} or use a supported Gateway policy section.`,
+    );
+  }
 
   const exposure = isRecord(value.exposure) ? value.exposure : {};
   const auth = isRecord(value.auth) ? value.auth : {};
   const controlUi = isRecord(value.controlUi) ? value.controlUi : {};
   const remote = isRecord(value.remote) ? value.remote : {};
   const http = isRecord(value.http) ? value.http : {};
+  for (const [section, sectionValue, allowedKeys] of [
+    ["exposure", exposure, ["allowNonLoopbackBind", "allowTailscaleFunnel"]],
+    ["auth", auth, ["requireAuth", "requireExplicitRateLimit"]],
+    ["controlUi", controlUi, ["allowInsecure"]],
+    ["remote", remote, ["allow"]],
+    ["http", http, ["denyEndpoints", "requireUrlAllowlists"]],
+  ] as const) {
+    const unsupportedKey = unsupportedPolicyKey(sectionValue, allowedKeys);
+    if (unsupportedKey !== undefined) {
+      return policyShapeFinding(
+        params.policyPath,
+        `oc://${params.policyDocName}/gateway/${section}/${ocPathSegment(unsupportedKey)}`,
+        `${params.policyPath} gateway.${section}.${unsupportedKey} is not supported in Gateway policy.`,
+        `Remove gateway.${section}.${unsupportedKey} or use a supported Gateway policy rule.`,
+      );
+    }
+  }
   const booleanRules = [
     [
       "gateway/exposure/allowNonLoopbackBind",
@@ -2100,6 +2965,15 @@ function policyStringArrayShapeFinding(
       `oc://${params.policyDocName}/${params.target}`,
       `${params.policyPath} ${params.property} must be an object.`,
       `Fix ${params.policyPath} so ${params.property} is an object.`,
+    );
+  }
+  const unsupportedKey = unsupportedPolicyKey(value, ["allow", "deny"]);
+  if (unsupportedKey !== undefined) {
+    return policyShapeFinding(
+      params.policyPath,
+      `oc://${params.policyDocName}/${params.target}/${ocPathSegment(unsupportedKey)}`,
+      `${params.policyPath} ${params.property}.${unsupportedKey} is not supported in policy.`,
+      `Remove ${params.property}.${unsupportedKey} or use ${params.property}.allow or ${params.property}.deny.`,
     );
   }
   for (const key of ["allow", "deny"] as const) {
@@ -2258,6 +3132,41 @@ function invalidChannelDenyRuleFindings(
         fixHint: `Fix ${policyPath} so channel deny rules are an array.`,
       },
     ];
+  }
+  for (const [index, rule] of policy.channels.denyRules.entries()) {
+    if (!isRecord(rule)) {
+      continue;
+    }
+    const unsupportedRuleKey = unsupportedPolicyKey(rule, ["id", "reason", "when"]);
+    if (unsupportedRuleKey !== undefined) {
+      return [
+        {
+          checkId: CHECK_IDS.policyInvalidFile,
+          severity: "error",
+          message: `${policyPath} channels.denyRules[${index}].${unsupportedRuleKey} is not supported in channel deny rules.`,
+          source: "policy",
+          path: policyPath,
+          target: `oc://${policyDocName}/channels/denyRules/#${index}/${ocPathSegment(unsupportedRuleKey)}`,
+          fixHint: `Remove channels.denyRules[${index}].${unsupportedRuleKey} or use id, when.provider, and reason.`,
+        },
+      ];
+    }
+    if (isRecord(rule.when)) {
+      const unsupportedWhenKey = unsupportedPolicyKey(rule.when, ["provider"]);
+      if (unsupportedWhenKey !== undefined) {
+        return [
+          {
+            checkId: CHECK_IDS.policyInvalidFile,
+            severity: "error",
+            message: `${policyPath} channels.denyRules[${index}].when.${unsupportedWhenKey} is not supported in channel deny rules.`,
+            source: "policy",
+            path: policyPath,
+            target: `oc://${policyDocName}/channels/denyRules/#${index}/when/${ocPathSegment(unsupportedWhenKey)}`,
+            fixHint: `Remove channels.denyRules[${index}].when.${unsupportedWhenKey} or use when.provider.`,
+          },
+        ];
+      }
+    }
   }
   const invalid = policy.channels.denyRules.findIndex((rule) => !isChannelDenyRule(rule));
   if (invalid < 0) {
@@ -2439,6 +3348,262 @@ function networkFindings(
         fixHint: "Disable this private-network access setting or update policy after review.",
       };
     });
+}
+
+function ingressFindings(
+  policy: unknown,
+  policyPath: string,
+  policyDocName: string,
+  evidence: PolicyEvidence,
+): readonly HealthFinding[] {
+  if (!isRecord(policy)) {
+    return [];
+  }
+  const findings: HealthFinding[] = [];
+  const ingressPolicy = policy.ingress;
+  if (
+    ingressPolicyShapeFinding(ingressPolicy, { policyDocName, policyPath }) === undefined &&
+    isRecord(ingressPolicy)
+  ) {
+    findings.push(
+      ...ingressFindingsForRule(ingressPolicy, policyDocName, "ingress", evidence, () => true),
+    );
+  }
+  if (hasValidScopedPolicy(policy, policyPath, policyDocName)) {
+    for (const target of channelScopedPolicyTargets(policy)) {
+      if (
+        ingressPolicyShapeFinding(target.overlay.ingress, {
+          policyDocName,
+          policyPath,
+          targetPrefix: `scopes/${ocPathSegment(target.scopeName)}/ingress`,
+          propertyPrefix: `scopes.${target.scopeName}.ingress`,
+          allowSession: false,
+        }) !== undefined ||
+        !isRecord(target.overlay.ingress)
+      ) {
+        continue;
+      }
+      findings.push(
+        ...ingressFindingsForRule(
+          target.overlay.ingress,
+          policyDocName,
+          `scopes/${ocPathSegment(target.scopeName)}/ingress`,
+          evidence,
+          (entry) => scopedIngressChannelMatches(entry, target.channelId),
+        ),
+      );
+    }
+  }
+  return findings;
+}
+
+function ingressFindingsForRule(
+  ingressPolicy: Record<string, unknown> | undefined,
+  policyDocName: string,
+  requirementBase: string,
+  evidence: PolicyEvidence,
+  evidenceFilter: (entry: PolicyIngressEvidence) => boolean,
+): readonly HealthFinding[] {
+  if (!isRecord(ingressPolicy)) {
+    return [];
+  }
+  return [
+    ...ingressDmScopeFindings(
+      ingressPolicy,
+      policyDocName,
+      requirementBase,
+      evidence,
+      evidenceFilter,
+    ),
+    ...ingressDmPolicyFindings(
+      ingressPolicy,
+      policyDocName,
+      requirementBase,
+      evidence,
+      evidenceFilter,
+    ),
+    ...ingressOpenGroupFindings(
+      ingressPolicy,
+      policyDocName,
+      requirementBase,
+      evidence,
+      evidenceFilter,
+    ),
+    ...ingressRequireMentionFindings(
+      ingressPolicy,
+      policyDocName,
+      requirementBase,
+      evidence,
+      evidenceFilter,
+    ),
+  ];
+}
+
+function ingressDmScopeFindings(
+  ingressPolicy: Record<string, unknown>,
+  policyDocName: string,
+  requirementBase: string,
+  evidence: PolicyEvidence,
+  evidenceFilter: (entry: PolicyIngressEvidence) => boolean,
+): readonly HealthFinding[] {
+  const required = readString(ingressPolicy, ["session", "requireDmScope"]);
+  if (required === undefined) {
+    return [];
+  }
+  return ingressEntries(evidence, "sessionDmScope")
+    .filter(evidenceFilter)
+    .filter((entry) => entry.value !== required)
+    .map((entry) =>
+      ingressFinding(entry, {
+        checkId: CHECK_IDS.policyIngressDmScopeUnapproved,
+        message: `session.dmScope '${entry.value ?? ""}' does not match policy.`,
+        requirement: `oc://${policyDocName}/${requirementBase}/session/requireDmScope`,
+        fixHint:
+          "Set session.dmScope to the required isolation scope or update policy after review.",
+      }),
+    );
+}
+
+function ingressDmPolicyFindings(
+  ingressPolicy: Record<string, unknown>,
+  policyDocName: string,
+  requirementBase: string,
+  evidence: PolicyEvidence,
+  evidenceFilter: (entry: PolicyIngressEvidence) => boolean,
+): readonly HealthFinding[] {
+  const allowed = new Set(readStringList(ingressPolicy, ["channels", "allowDmPolicies"]));
+  if (allowed.size === 0) {
+    return [];
+  }
+  return ingressEntries(evidence, "channelDmPolicy")
+    .filter(evidenceFilter)
+    .filter((entry) => typeof entry.value === "string" && !allowed.has(entry.value.toLowerCase()))
+    .map((entry) =>
+      ingressFinding(entry, {
+        checkId: CHECK_IDS.policyIngressDmPolicyUnapproved,
+        message: `${ingressLabel(entry)} uses unapproved DM policy '${entry.value ?? ""}'.`,
+        requirement: `oc://${policyDocName}/${requirementBase}/channels/allowDmPolicies`,
+        fixHint: "Set the channel DM policy to an allowed value or update policy after review.",
+      }),
+    );
+}
+
+function ingressOpenGroupFindings(
+  ingressPolicy: Record<string, unknown>,
+  policyDocName: string,
+  requirementBase: string,
+  evidence: PolicyEvidence,
+  evidenceFilter: (entry: PolicyIngressEvidence) => boolean,
+): readonly HealthFinding[] {
+  if (readPolicyBoolean(ingressPolicy, ["channels", "denyOpenGroups"]) !== true) {
+    return [];
+  }
+  return ingressEntries(evidence, "channelGroupPolicy")
+    .filter(evidenceFilter)
+    .filter((entry) => entry.value !== "allowlist" && entry.value !== "disabled")
+    .map((entry) =>
+      ingressFinding(entry, {
+        checkId: CHECK_IDS.policyIngressOpenGroupsDenied,
+        message: `${ingressLabel(entry)} allows open group ingress.`,
+        requirement: `oc://${policyDocName}/${requirementBase}/channels/denyOpenGroups`,
+        fixHint: "Set groupPolicy to allowlist or disabled, or update policy after review.",
+      }),
+    );
+}
+
+function ingressRequireMentionFindings(
+  ingressPolicy: Record<string, unknown>,
+  policyDocName: string,
+  requirementBase: string,
+  evidence: PolicyEvidence,
+  evidenceFilter: (entry: PolicyIngressEvidence) => boolean,
+): readonly HealthFinding[] {
+  if (readPolicyBoolean(ingressPolicy, ["channels", "requireMentionInGroups"]) !== true) {
+    return [];
+  }
+  const groupPolicies = ingressEntries(evidence, "channelGroupPolicy").filter(evidenceFilter);
+  return ingressEntries(evidence, "channelRequireMention")
+    .filter(evidenceFilter)
+    .filter((entry) => !isGroupIngressDisabled(entry, groupPolicies))
+    .filter((entry) => entry.value !== true)
+    .map((entry) =>
+      ingressFinding(entry, {
+        checkId: CHECK_IDS.policyIngressGroupMentionRequired,
+        message: `${ingressLabel(entry)} does not require group mentions.`,
+        requirement: `oc://${policyDocName}/${requirementBase}/channels/requireMentionInGroups`,
+        fixHint:
+          "Set requireMention=true for the channel/group entry or update policy after review.",
+      }),
+    );
+}
+
+function isGroupIngressDisabled(
+  entry: PolicyIngressEvidence,
+  groupPolicies: readonly PolicyIngressEvidence[],
+): boolean {
+  const entryParent = ocPathParent(entry.source);
+  const channelDefaultsParent = "oc://openclaw.config/channels/defaults";
+  const matches = groupPolicies
+    .filter((candidate) => {
+      const candidateParent = ocPathParent(candidate.source);
+      return (
+        candidate.channel === entry.channel &&
+        (candidate.accountId ?? "") === (entry.accountId ?? "") &&
+        (candidateParent === channelDefaultsParent ||
+          entryParent === candidateParent ||
+          entryParent.startsWith(`${candidateParent}/`))
+      );
+    })
+    .toSorted(
+      (left, right) => ocPathParent(right.source).length - ocPathParent(left.source).length,
+    );
+  return matches[0]?.value === "disabled";
+}
+
+function ocPathParent(source: string): string {
+  return source.slice(0, Math.max(0, source.lastIndexOf("/")));
+}
+
+function ingressEntries(
+  evidence: PolicyEvidence,
+  kind: PolicyIngressEvidence["kind"],
+): readonly PolicyIngressEvidence[] {
+  return (evidence.ingress ?? []).filter((entry) => entry.kind === kind);
+}
+
+function scopedIngressChannelMatches(
+  entry: PolicyIngressEvidence,
+  policyChannelId: string,
+): boolean {
+  return normalizePolicyChannelId(entry.channel ?? "") === policyChannelId;
+}
+
+function ingressFinding(
+  entry: PolicyIngressEvidence,
+  params: {
+    readonly checkId: (typeof POLICY_CHECK_IDS)[number];
+    readonly message: string;
+    readonly requirement: string;
+    readonly fixHint: string;
+  },
+): HealthFinding {
+  return {
+    checkId: params.checkId,
+    severity: "error",
+    message: params.message,
+    source: "policy",
+    path: "openclaw config",
+    ocPath: entry.source,
+    target: entry.source,
+    requirement: params.requirement,
+    fixHint: params.fixHint,
+  };
+}
+
+function ingressLabel(entry: PolicyIngressEvidence): string {
+  const account = entry.accountId === undefined ? "" : ` account '${entry.accountId}'`;
+  const group = entry.groupId === undefined ? "" : ` group '${entry.groupId}'`;
+  return `channel '${entry.channel ?? "unknown"}'${account}${group}`;
 }
 
 function gatewayExposureFindings(
@@ -3713,10 +4878,10 @@ function bindHostLooksLikeContainerRuntimeSocket(value: string | undefined): boo
     return false;
   }
   const normalized = value.replaceAll("\\", "/").toLowerCase();
-  const basename = normalized.split("/").at(-1) ?? "";
+  const basenameLocal = normalized.split("/").at(-1) ?? "";
   return (
     CONTAINER_RUNTIME_SOCKET_PATHS.has(normalized) ||
-    CONTAINER_RUNTIME_SOCKET_BASENAMES.has(basename)
+    CONTAINER_RUNTIME_SOCKET_BASENAMES.has(basenameLocal)
   );
 }
 
@@ -3745,6 +4910,334 @@ function secretAuthProvenanceFindings(
   ];
 }
 
+function dataHandlingFindings(
+  policy: unknown,
+  policyPath: string,
+  policyDocName: string,
+  evidence: PolicyEvidence,
+): readonly HealthFinding[] {
+  const shapeFindings = dataHandlingPolicyShapeFindings(policy, policyPath, policyDocName);
+  if (shapeFindings.length > 0) {
+    return shapeFindings;
+  }
+  const findings: HealthFinding[] = [];
+  findings.push(
+    ...dataHandlingFindingsForRule(policy, policyDocName, "dataHandling", evidence, () => true),
+  );
+  for (const target of agentScopedPolicyTargets(policy)) {
+    if (!dataHandlingPolicyHasRules(target.overlay.dataHandling)) {
+      continue;
+    }
+    findings.push(
+      ...dataHandlingFindingsForRule(
+        target.overlay,
+        policyDocName,
+        `scopes/${ocPathSegment(target.scopeName)}/dataHandling`,
+        evidence,
+        (entry) =>
+          entry.kind !== "memorySessionTranscriptIndexing" ||
+          scopedDataHandlingAgentMatches(entry, target.agentId, evidence.dataHandling ?? []),
+      ),
+    );
+  }
+  return findings;
+}
+
+function scopedDataHandlingAgentMatches(
+  entry: PolicyDataHandlingEvidence,
+  policyAgentId: string,
+  entries: readonly PolicyDataHandlingEvidence[],
+): boolean {
+  if (entry.id === "memory-qmd-session-transcripts") {
+    return true;
+  }
+  if (scopedAgentIdMatches(entry.agentId, policyAgentId)) {
+    return true;
+  }
+  return (
+    entry.id === "agents-defaults-memory-session-transcripts" &&
+    !entries.some(
+      (candidate) =>
+        candidate.scope === "agent" &&
+        candidate.kind === entry.kind &&
+        scopedAgentIdMatches(candidate.agentId, policyAgentId),
+    )
+  );
+}
+
+function dataHandlingFindingsForRule(
+  policy: unknown,
+  policyDocName: string,
+  requirementBase: string,
+  evidence: PolicyEvidence,
+  evidenceFilter: (entry: PolicyDataHandlingEvidence) => boolean,
+): readonly HealthFinding[] {
+  const dataHandling = isRecord(policy) ? policy.dataHandling : undefined;
+  if (!isRecord(dataHandling)) {
+    return [];
+  }
+  const findings: HealthFinding[] = [];
+  if (readPolicyBoolean(dataHandling, ["sensitiveLogging", "requireRedaction"]) === true) {
+    findings.push(
+      ...dataHandlingEntries(evidence, "sensitiveLoggingRedaction")
+        .filter(evidenceFilter)
+        .filter((entry) => entry.value !== true)
+        .map((entry) =>
+          dataHandlingFinding(entry, {
+            checkId: CHECK_IDS.policyDataHandlingRedactionDisabled,
+            message: "Sensitive logging redaction is disabled.",
+            requirement: `oc://${policyDocName}/${requirementBase}/sensitiveLogging/requireRedaction`,
+            fixHint: "Set logging.redactSensitive to tools or update policy after review.",
+          }),
+        ),
+    );
+  }
+  if (readPolicyBoolean(dataHandling, ["telemetry", "denyContentCapture"]) === true) {
+    findings.push(
+      ...dataHandlingEntries(evidence, "telemetryContentCapture")
+        .filter(evidenceFilter)
+        .filter((entry) => entry.value === true)
+        .map((entry) =>
+          dataHandlingFinding(entry, {
+            checkId: CHECK_IDS.policyDataHandlingTelemetryContentCapture,
+            message: "Telemetry content capture is enabled.",
+            requirement: `oc://${policyDocName}/${requirementBase}/telemetry/denyContentCapture`,
+            fixHint: "Disable diagnostics.otel.captureContent or update policy after review.",
+          }),
+        ),
+    );
+  }
+  if (readPolicyBoolean(dataHandling, ["retention", "requireSessionMaintenance"]) === true) {
+    findings.push(
+      ...dataHandlingEntries(evidence, "sessionRetentionMode")
+        .filter(evidenceFilter)
+        .filter((entry) => entry.value !== "enforce")
+        .map((entry) =>
+          dataHandlingFinding(entry, {
+            checkId: CHECK_IDS.policyDataHandlingSessionRetentionNotEnforced,
+            message: `Session retention maintenance mode is '${entry.value ?? "unknown"}'.`,
+            requirement: `oc://${policyDocName}/${requirementBase}/retention/requireSessionMaintenance`,
+            fixHint: "Set session.maintenance.mode to enforce or update policy after review.",
+          }),
+        ),
+    );
+  }
+  if (readPolicyBoolean(dataHandling, ["memory", "denySessionTranscriptIndexing"]) === true) {
+    findings.push(
+      ...dataHandlingEntries(evidence, "memorySessionTranscriptIndexing")
+        .filter(evidenceFilter)
+        .filter((entry) => entry.value === true)
+        .map((entry) =>
+          dataHandlingFinding(entry, {
+            checkId: CHECK_IDS.policyDataHandlingSessionTranscriptMemory,
+            message: `${dataHandlingLabel(entry)} enables session transcript memory indexing.`,
+            requirement: `oc://${policyDocName}/${requirementBase}/memory/denySessionTranscriptIndexing`,
+            fixHint:
+              "Disable session transcript memory indexing for the matching config surface or update policy after review.",
+          }),
+        ),
+    );
+  }
+  return findings;
+}
+
+function dataHandlingPolicyShapeFindings(
+  policy: unknown,
+  policyPath: string,
+  policyDocName: string,
+): readonly HealthFinding[] {
+  if (!isRecord(policy)) {
+    return [];
+  }
+  if (!isRecord(policy.dataHandling)) {
+    return [];
+  }
+  return [
+    policySectionUnsupportedKeyFinding(policy.dataHandling, {
+      policyPath,
+      policyDocName,
+      propertyPath: "dataHandling",
+      targetPath: "dataHandling",
+      sectionName: "data-handling",
+      allowedKeys: ["memory", "retention", "sensitiveLogging", "telemetry"],
+    }),
+    dataHandlingSectionShapeFinding(policy.dataHandling, {
+      policyPath,
+      policyDocName,
+      propertyPath: "dataHandling.sensitiveLogging",
+      targetPath: "dataHandling/sensitiveLogging",
+      section: "sensitiveLogging",
+    }),
+    dataHandlingSectionShapeFinding(policy.dataHandling, {
+      policyPath,
+      policyDocName,
+      propertyPath: "dataHandling.telemetry",
+      targetPath: "dataHandling/telemetry",
+      section: "telemetry",
+    }),
+    dataHandlingSectionShapeFinding(policy.dataHandling, {
+      policyPath,
+      policyDocName,
+      propertyPath: "dataHandling.retention",
+      targetPath: "dataHandling/retention",
+      section: "retention",
+    }),
+    dataHandlingSectionShapeFinding(policy.dataHandling, {
+      policyPath,
+      policyDocName,
+      propertyPath: "dataHandling.memory",
+      targetPath: "dataHandling/memory",
+      section: "memory",
+    }),
+    dataHandlingBooleanShapeFinding(policy.dataHandling, {
+      policyPath,
+      policyDocName,
+      propertyPath: "dataHandling.sensitiveLogging.requireRedaction",
+      targetPath: "dataHandling/sensitiveLogging/requireRedaction",
+      path: ["sensitiveLogging", "requireRedaction"],
+    }),
+    dataHandlingBooleanShapeFinding(policy.dataHandling, {
+      policyPath,
+      policyDocName,
+      propertyPath: "dataHandling.telemetry.denyContentCapture",
+      targetPath: "dataHandling/telemetry/denyContentCapture",
+      path: ["telemetry", "denyContentCapture"],
+    }),
+    dataHandlingBooleanShapeFinding(policy.dataHandling, {
+      policyPath,
+      policyDocName,
+      propertyPath: "dataHandling.retention.requireSessionMaintenance",
+      targetPath: "dataHandling/retention/requireSessionMaintenance",
+      path: ["retention", "requireSessionMaintenance"],
+    }),
+    dataHandlingBooleanShapeFinding(policy.dataHandling, {
+      policyPath,
+      policyDocName,
+      propertyPath: "dataHandling.memory.denySessionTranscriptIndexing",
+      targetPath: "dataHandling/memory/denySessionTranscriptIndexing",
+      path: ["memory", "denySessionTranscriptIndexing"],
+    }),
+  ].filter((finding): finding is HealthFinding => finding !== undefined);
+}
+
+function policySectionUnsupportedKeyFinding(
+  value: Record<string, unknown>,
+  params: {
+    readonly policyPath: string;
+    readonly policyDocName: string;
+    readonly propertyPath: string;
+    readonly targetPath: string;
+    readonly sectionName: string;
+    readonly allowedKeys: readonly string[];
+  },
+): HealthFinding | undefined {
+  const unsupportedKey = unsupportedPolicyKey(value, params.allowedKeys);
+  if (unsupportedKey === undefined) {
+    return undefined;
+  }
+  return policyShapeFinding(
+    params.policyPath,
+    `oc://${params.policyDocName}/${params.targetPath}/${ocPathSegment(unsupportedKey)}`,
+    `${params.policyPath} ${params.propertyPath}.${unsupportedKey} is not supported in ${params.sectionName} policy.`,
+    `Remove ${params.propertyPath}.${unsupportedKey} or use a supported ${params.sectionName} policy rule.`,
+  );
+}
+
+function dataHandlingSectionShapeFinding(
+  dataHandling: Record<string, unknown>,
+  params: {
+    readonly policyPath: string;
+    readonly policyDocName: string;
+    readonly propertyPath: string;
+    readonly targetPath: string;
+    readonly section: string;
+  },
+): HealthFinding | undefined {
+  const value = dataHandling[params.section];
+  if (value === undefined || isRecord(value)) {
+    return undefined;
+  }
+  return policyShapeFinding(
+    params.policyPath,
+    `oc://${params.policyDocName}/${params.targetPath}`,
+    `${params.policyPath} ${params.propertyPath} must be an object.`,
+    `Fix ${params.propertyPath} so it contains boolean policy rules.`,
+  );
+}
+
+function dataHandlingBooleanShapeFinding(
+  dataHandling: unknown,
+  params: {
+    readonly policyPath: string;
+    readonly policyDocName: string;
+    readonly propertyPath: string;
+    readonly targetPath: string;
+    readonly path: readonly string[];
+  },
+): HealthFinding | undefined {
+  const value = getPolicyPath(dataHandling, params.path);
+  if (isRecord(dataHandling) && typeof params.path[0] === "string") {
+    const section = dataHandling[params.path[0]];
+    if (isRecord(section) && typeof params.path[1] === "string") {
+      const sectionPath = params.path.slice(0, -1).join(".");
+      const unsupportedKey = unsupportedPolicyKey(section, [params.path[1]]);
+      if (unsupportedKey !== undefined) {
+        return policyShapeFinding(
+          params.policyPath,
+          `oc://${params.policyDocName}/${params.targetPath
+            .split("/")
+            .slice(0, -1)
+            .join("/")}/${ocPathSegment(unsupportedKey)}`,
+          `${params.policyPath} dataHandling.${sectionPath}.${unsupportedKey} is not supported in data-handling policy.`,
+          `Remove dataHandling.${sectionPath}.${unsupportedKey} or use ${params.propertyPath}.`,
+        );
+      }
+    }
+  }
+  if (value === undefined || typeof value === "boolean") {
+    return undefined;
+  }
+  return policyShapeFinding(
+    params.policyPath,
+    `oc://${params.policyDocName}/${params.targetPath}`,
+    `${params.policyPath} ${params.propertyPath} must be a boolean.`,
+    `Set ${params.propertyPath} to true or false.`,
+  );
+}
+
+function dataHandlingEntries(
+  evidence: PolicyEvidence,
+  kind: PolicyDataHandlingEvidence["kind"],
+): readonly PolicyDataHandlingEvidence[] {
+  return (evidence.dataHandling ?? []).filter((entry) => entry.kind === kind);
+}
+
+function dataHandlingFinding(
+  entry: PolicyDataHandlingEvidence,
+  params: {
+    readonly checkId: (typeof POLICY_CHECK_IDS)[number];
+    readonly message: string;
+    readonly requirement: string;
+    readonly fixHint: string;
+  },
+): HealthFinding {
+  return {
+    checkId: params.checkId,
+    severity: "error",
+    message: params.message,
+    source: "policy",
+    path: "openclaw config",
+    ocPath: entry.source,
+    target: entry.source,
+    requirement: params.requirement,
+    fixHint: params.fixHint,
+  };
+}
+
+function dataHandlingLabel(entry: PolicyDataHandlingEvidence): string {
+  return entry.agentId === undefined ? "Global data handling config" : `agent '${entry.agentId}'`;
+}
+
 function policyHasSecretRules(policy: unknown): boolean {
   if (!isRecord(policy) || !isRecord(policy.secrets)) {
     return false;
@@ -3763,6 +5256,32 @@ function policyHasAuthProfileRules(policy: unknown): boolean {
     isRecord(policy.auth.profiles) &&
     (policy.auth.profiles.requireMetadata !== undefined ||
       policy.auth.profiles.allowModes !== undefined)
+  );
+}
+
+function policyHasIngressRules(policy: unknown): boolean {
+  if (!isRecord(policy)) {
+    return false;
+  }
+  if (ingressPolicyHasRules(policy.ingress)) {
+    return true;
+  }
+  return agentScopedPolicyOverlays(policy).some(([, overlay]) =>
+    ingressPolicyHasRules(overlay.ingress),
+  );
+}
+
+function ingressPolicyHasRules(value: unknown): boolean {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const ingress = value;
+  return (
+    (isRecord(ingress.session) && ingress.session.requireDmScope !== undefined) ||
+    (isRecord(ingress.channels) &&
+      (ingress.channels.allowDmPolicies !== undefined ||
+        ingress.channels.denyOpenGroups !== undefined ||
+        ingress.channels.requireMentionInGroups !== undefined))
   );
 }
 
@@ -3826,6 +5345,34 @@ function sandboxPosturePolicyHasRules(value: unknown): boolean {
   );
 }
 
+function policyHasDataHandlingRules(policy: unknown): boolean {
+  if (!isRecord(policy)) {
+    return false;
+  }
+  if (dataHandlingPolicyHasRules(policy.dataHandling)) {
+    return true;
+  }
+  return agentScopedPolicyOverlays(policy).some(([, overlay]) =>
+    dataHandlingPolicyHasRules(overlay.dataHandling),
+  );
+}
+
+function dataHandlingPolicyHasRules(value: unknown): boolean {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const dataHandling = value;
+  return (
+    (isRecord(dataHandling.sensitiveLogging) &&
+      dataHandling.sensitiveLogging.requireRedaction !== undefined) ||
+    (isRecord(dataHandling.telemetry) && dataHandling.telemetry.denyContentCapture !== undefined) ||
+    (isRecord(dataHandling.retention) &&
+      dataHandling.retention.requireSessionMaintenance !== undefined) ||
+    (isRecord(dataHandling.memory) &&
+      dataHandling.memory.denySessionTranscriptIndexing !== undefined)
+  );
+}
+
 function policyHasToolPostureRules(policy: unknown): boolean {
   if (!isRecord(policy)) {
     return false;
@@ -3866,6 +5413,12 @@ type AgentScopedPolicyTarget = {
   readonly overlay: Record<string, unknown>;
 };
 
+type ChannelScopedPolicyTarget = {
+  readonly scopeName: string;
+  readonly channelId: string;
+  readonly overlay: Record<string, unknown>;
+};
+
 function agentScopedPolicyOverlays(
   policy: unknown,
 ): readonly (readonly [string, Record<string, unknown>])[] {
@@ -3893,7 +5446,23 @@ function agentScopedPolicyTargets(policy: unknown): readonly AgentScopedPolicyTa
   return targets;
 }
 
-type ScopedAgentPolicyField = {
+function channelScopedPolicyTargets(policy: unknown): readonly ChannelScopedPolicyTarget[] {
+  const targets: ChannelScopedPolicyTarget[] = [];
+  for (const [scopeName, overlay] of agentScopedPolicyOverlays(policy)) {
+    if (!Array.isArray(overlay.channelIds)) {
+      continue;
+    }
+    for (const rawChannelId of overlay.channelIds) {
+      if (typeof rawChannelId !== "string" || rawChannelId.trim() === "") {
+        continue;
+      }
+      targets.push({ scopeName, channelId: normalizePolicyChannelId(rawChannelId), overlay });
+    }
+  }
+  return targets;
+}
+
+type ScopedPolicyField = {
   readonly fieldPath: string;
   readonly propertyPath: string;
   readonly targetPath: string;
@@ -3901,12 +5470,39 @@ type ScopedAgentPolicyField = {
   readonly value: unknown;
 };
 
-function duplicateScopedAgentFieldFinding(
-  scopedAgents: Record<string, unknown>,
+function duplicateScopedPolicyFieldFinding(
+  scopes: Record<string, unknown>,
   params: {
     readonly policyDocName: string;
     readonly policyPath: string;
     readonly policy: Record<string, unknown>;
+  },
+): HealthFinding | undefined {
+  return (
+    duplicateScopedFieldFinding(scopes, {
+      ...params,
+      selector: "agentIds",
+      selectorLabel: "agent",
+      normalize: normalizeAgentId,
+    }) ??
+    duplicateScopedFieldFinding(scopes, {
+      ...params,
+      selector: "channelIds",
+      selectorLabel: "channel",
+      normalize: normalizePolicyChannelId,
+    })
+  );
+}
+
+function duplicateScopedFieldFinding(
+  scopes: Record<string, unknown>,
+  params: {
+    readonly policyDocName: string;
+    readonly policyPath: string;
+    readonly policy: Record<string, unknown>;
+    readonly selector: PolicyScopeSelectorKind;
+    readonly selectorLabel: string;
+    readonly normalize: (value: string) => string;
   },
 ): HealthFinding | undefined {
   const seen = new Map<
@@ -3914,22 +5510,23 @@ function duplicateScopedAgentFieldFinding(
     {
       readonly scopeName: string;
       readonly propertyPath: string;
-      readonly field: ScopedAgentPolicyField;
+      readonly field: ScopedPolicyField;
     }
   >();
-  for (const [scopeName, overlay] of Object.entries(scopedAgents)) {
+  for (const [scopeName, overlay] of Object.entries(scopes)) {
     if (!isRecord(overlay)) {
       continue;
     }
-    if (!Array.isArray(overlay.agentIds)) {
+    const selectorValues = overlay[params.selector];
+    if (!Array.isArray(selectorValues)) {
       continue;
     }
-    const fields = scopedAgentPolicyFields(scopeName, overlay);
-    for (const rawAgentId of overlay.agentIds) {
-      if (typeof rawAgentId !== "string" || rawAgentId.trim() === "") {
+    const fields = scopedPolicyFields(scopeName, overlay, params.selector);
+    for (const rawSelectorValue of selectorValues) {
+      if (typeof rawSelectorValue !== "string" || rawSelectorValue.trim() === "") {
         continue;
       }
-      const agentId = normalizeAgentId(rawAgentId);
+      const selectorValue = params.normalize(rawSelectorValue);
       for (const field of fields) {
         const topLevelValue = getPolicyPath(params.policy, field.metadata.policyPath);
         if (
@@ -3943,7 +5540,7 @@ function duplicateScopedAgentFieldFinding(
             `Use an equally or more restrictive scoped value, or remove the scoped override.`,
           );
         }
-        const key = `${agentId}\0${field.fieldPath}`;
+        const key = `${selectorValue}\0${field.fieldPath}`;
         const previous = seen.get(key);
         if (previous !== undefined) {
           if (isPolicyValueAtLeastAsStrict(field.metadata, field.value, previous.field.value)) {
@@ -3957,8 +5554,8 @@ function duplicateScopedAgentFieldFinding(
           return policyShapeFinding(
             params.policyPath,
             `oc://${params.policyDocName}/${field.targetPath}`,
-            `${params.policyPath} scopes.${scopeName}.${field.propertyPath} is not an equally or more restrictive override of ${previous.propertyPath} for agent '${agentId}'.`,
-            `Use one effective scoped value per agent, or make later scoped values stricter according to policy metadata.`,
+            `${params.policyPath} scopes.${scopeName}.${field.propertyPath} is not an equally or more restrictive override of ${previous.propertyPath} for ${params.selectorLabel} '${selectorValue}'.`,
+            `Use one effective scoped value per ${params.selectorLabel}, or make later scoped values stricter according to policy metadata.`,
           );
         }
         seen.set(key, {
@@ -3972,12 +5569,13 @@ function duplicateScopedAgentFieldFinding(
   return undefined;
 }
 
-function scopedAgentPolicyFields(
+function scopedPolicyFields(
   scopeName: string,
   overlay: Record<string, unknown>,
-): readonly ScopedAgentPolicyField[] {
+  selector: PolicyScopeSelectorKind,
+): readonly ScopedPolicyField[] {
   const prefix = `scopes/${ocPathSegment(scopeName)}`;
-  return POLICY_RULE_METADATA.filter((rule) => rule.scopeSelectors?.includes("agentIds"))
+  return POLICY_RULES.filter((rule) => rule.scopeSelectors?.includes(selector) === true)
     .map((rule) => ({ rule, value: scopedPolicyValue(overlay, rule.policyPath) }))
     .filter((entry) => entry.value !== undefined)
     .map(({ rule, value }) => ({
@@ -3999,6 +5597,8 @@ export function isPolicyValueAtLeastAsStrict(
       return isPolicyAllowlistSubset(metadata, candidate, baseline);
     case "denylist-superset":
       return isPolicyDenylistSuperset(metadata, candidate, baseline);
+    case "ordered-string":
+      return isPolicyOrderedStringAtLeastAsStrict(metadata, candidate, baseline);
     case "requires-true":
       return baseline !== true || candidate === true;
     case "requires-false":
@@ -4007,6 +5607,28 @@ export function isPolicyValueAtLeastAsStrict(
       return samePolicyStringList(candidate, baseline, metadata);
   }
   return false;
+}
+
+function isPolicyOrderedStringAtLeastAsStrict(
+  metadata: PolicyRuleMetadata,
+  candidate: unknown,
+  baseline: unknown,
+): boolean {
+  const candidateValue = policyString(candidate, metadata);
+  const baselineValue = policyString(baseline, metadata);
+  if (
+    candidateValue === undefined ||
+    baselineValue === undefined ||
+    metadata.orderedValues === undefined
+  ) {
+    return false;
+  }
+  const orderedValues = metadata.orderedValues.map((entry) =>
+    metadata.caseSensitive === true ? entry : entry.toLowerCase(),
+  );
+  const candidateIndex = orderedValues.indexOf(candidateValue);
+  const baselineIndex = orderedValues.indexOf(baselineValue);
+  return candidateIndex >= 0 && baselineIndex >= 0 && candidateIndex >= baselineIndex;
 }
 
 function isPolicyAllowlistSubset(
@@ -4070,13 +5692,51 @@ function policyStringList(
   value: unknown,
   metadata: PolicyRuleMetadata,
 ): readonly string[] | undefined {
+  if (metadata.valueType === "channel-provider-deny-rules") {
+    return channelProviderDenyRuleList(value, metadata);
+  }
   if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string")) {
     return undefined;
   }
   return value
     .map((entry) => entry.trim())
     .filter(Boolean)
-    .map((entry) => (metadata.caseSensitive === true ? entry : entry.toLowerCase()));
+    .map((entry) => normalizePolicyStringListEntry(entry, metadata));
+}
+
+function normalizePolicyStringListEntry(entry: string, metadata: PolicyRuleMetadata): string {
+  if (metadata.normalizeValues === "model-provider") {
+    return normalizeProviderId(entry);
+  }
+  return metadata.caseSensitive === true ? entry : entry.toLowerCase();
+}
+
+function channelProviderDenyRuleList(
+  value: unknown,
+  metadata: PolicyRuleMetadata,
+): readonly string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const providers: string[] = [];
+  for (const entry of value) {
+    if (!isChannelDenyRule(entry)) {
+      return undefined;
+    }
+    const provider = entry.when?.provider?.trim();
+    if (provider !== undefined && provider !== "") {
+      providers.push(metadata.caseSensitive === true ? provider : provider.toLowerCase());
+    }
+  }
+  return providers;
+}
+
+function policyString(value: unknown, metadata: PolicyRuleMetadata): string | undefined {
+  if (typeof value !== "string" || value.trim() === "") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return metadata.caseSensitive === true ? trimmed : trimmed.toLowerCase();
 }
 
 function scopedPolicyValue(overlay: Record<string, unknown>, path: readonly string[]): unknown {
@@ -4463,7 +6123,7 @@ async function readPolicyFile(
   const displayName = policyDisplayName(ctx);
   const path = resolveWorkspacePath(ctx, policyPathSetting(ctx));
   try {
-    const fs = await import("node:fs/promises");
+    const fs = await loadFsPromisesModule();
     return {
       raw: await fs.readFile(path, "utf-8"),
       path,
@@ -4484,7 +6144,7 @@ async function readWorkspaceFile(
 ): Promise<{ raw: string; path: string } | null> {
   const path = resolveWorkspacePath(ctx, fileName);
   try {
-    const fs = await import("node:fs/promises");
+    const fs = await loadFsPromisesModule();
     return { raw: await fs.readFile(path, "utf-8"), path };
   } catch (err) {
     if (isNotFound(err)) {
@@ -4724,6 +6384,17 @@ function readStringList(
   return readPolicyStringArray(policy, path, options) ?? [];
 }
 
+function readString(policy: unknown, path: readonly string[]): string | undefined {
+  let current: unknown = policy;
+  for (const part of path) {
+    if (!isRecord(current)) {
+      return undefined;
+    }
+    current = current[part];
+  }
+  return typeof current === "string" ? current.trim().toLowerCase() : undefined;
+}
+
 function ocPathSegment(value: string): string {
   if (/^(?:[A-Za-z0-9_-]+|#\d+)$/.test(value)) {
     return value;
@@ -4777,6 +6448,10 @@ function normalizePolicyToolName(value: string): string {
     return "apply_patch";
   }
   return normalized;
+}
+
+function normalizePolicyChannelId(value: string): string {
+  return value.trim().toLowerCase();
 }
 
 function policyPathSetting(ctx: HealthCheckContext): string {
